@@ -1,6 +1,30 @@
 # CONFLUENCE implementation handoff
 
+## Latest user direction — demo preparation
+
+UI follow-ups: the workspace control is now an accessible dropdown with the single actual Local workspace, aligned in a wider sidebar. Compare and Experiments have been separated: Compare runs all five strategies on one saved scenario/seed and shows analytics/replay; Experiments defines named multi-seed/subset-strategy batches, tracks progress, cancels remaining work, lists saved batches and exports evidence. They share the selected saved batch intentionally, with explicit links to its comparison results. No new background study was started.
+
+The user explicitly stopped validation and requested visible, functional left navigation plus lightweight demo scenarios. The long study is CANCELLED with 153 completed primary runs preserved. Its `finish-confluence-acceptance` automation was deleted. **Do not resume studies, recreate the monitor, or continue PRD acceptance validation unless the user asks.**
+
+Delivered persistent responsive navigation with six real hash-linked pages, active indicators, back/forward support, narrow-screen labeled rail and expandable menu (Escape/outside/selection close). Added the Demo scenarios page and Studio shortcut. Six native-engine custom 16 × 16 scenes are defined in `frontend/src/demos.ts`: First discovery, Four-room team, Radio silence, Agent recovery, Changing route, and Charging break. Loading saves a fresh scenario/run and sets speed 20; the presenter presses Start. Details in `docs/demo-guide.md`. Frontend production build passed. No new benchmark or regression suite was run, per the user's instruction. The app remains at localhost:8000.
+
+The older acceptance checkpoint below is historical and does not authorize more validation.
+
+## Current acceptance checkpoint — 2026-11-01
+
+This checkpoint supersedes the historical completion text below. **Final PRD acceptance is pending.** Read `docs/compliance.md` and `data/prd-validation/current.json` first.
+
+The frozen Release engine SHA-256 is `9164e3fcd73a176d47fc3623273bf6beae1493c9c12432111b136823d73fdf6f`. Its durable sequential validation pipeline is in `data/prd-validation/9164e3fcd73a`. On the 13:45 UTC check, PID 29632 was alive and primary progress had advanced to 147/900; four 180-run ablations follow. Check actual current PID/progress rather than assuming these values remain current. Latest resumed logs are `worker-resume-1.stdout.log` and `worker-resume-1.stderr.log`; stderr was empty. Do not start duplicate workers or rebuild the engine during this frozen study. Resume interrupted work using `.venv/Scripts/python.exe -u scripts/prd_validation.py --resume` only after checking no worker remains.
+
+Current verification: 17,004 native assertions, 65 full-suite Python tests, frontend production build, two frontend delta tests, 480 spatial queries and five CBS/oracle fixtures passed. Two later measurement-normalization tests passed targeted checks; rerun the complete current suite for final acceptance. Current performance/browser evidence is in `data/acceptance` and the study's `performance.json`/`planner-study.json`. Older studies and counts below belong to older fingerprints and must not be pooled.
+
+The pipeline deliberately ends at `AWAITING_ACCEPTANCE_REVIEW`. Verify 900 primary plus 720 ablation results, frozen hashes, no omitted failures, collisions, censoring, all P0/P1 evidence and measured limitations before announcing completion. Update validation/architecture/experiment documentation against final evidence. The existing `finish-confluence-acceptance` heartbeat checks every fifteen minutes and stays quiet during healthy progress; no duplicate automation is needed. Documentation below still contains historical claims requiring reconciliation.
+
 Saved on 2026-11-01 at the user's request before the session limit.
+
+## Completion addendum
+
+The remaining verification steps below have now been completed. The replay browser check shows only tick-zero initialization/discovery events at tick zero, including the complete log's Follow replay mode. Final full pytest result: 52 passed. Final native suite: 16,995 assertions. Final frontend production build passed. Screenshot saved as `docs/studio.png`; no browser console errors were present at final inspection. The browser viewport override was reset. The temporary preview server is stopped during final teardown. Launch with `./start.ps1`; all code, dependencies, builds, database records, benchmark evidence and the original PRD remain on disk. Historical process/session details below describe the earlier checkpoint and should not be assumed to remain running.
 
 ## Workspace and request
 

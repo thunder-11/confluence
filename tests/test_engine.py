@@ -205,6 +205,10 @@ def test_runtime_cbs_uses_delivered_joint_plans():
     assert states[-1]["status"] == "COMPLETED"
     assert any(e["type"] == "joint_plan_committed" for e in events)
     assert any(
+        e["type"] == "message_delivered" and e["payload"]["kind"] == "joint_prepare"
+        for e in events
+    )
+    assert any(
         e["type"] == "message_delivered" and e["payload"]["kind"] == "joint_ack"
         for e in events
     )
@@ -322,6 +326,7 @@ def test_cbs_communication_outage_has_bounded_fallback():
         for e in events
     )
     assert states[-1]["metrics"]["distance"] > 0
+    assert any(a["distance"] > 0 for a in states[5]["agents"])
 
 
 def test_disconnected_target_chamber_reports_reachable_and_global_separately():
@@ -365,3 +370,160 @@ def test_unknown_maze_finishes_boundary_mapping_after_long_detours():
     )
     assert states[-1]["status"] == "COMPLETED"
     assert states[-1]["metrics"]["mappingCoverage"] == 100
+
+
+def test_productivity_and_communication_metrics_reconcile_with_events():
+    _, states, events = execute(fixture_config(strategy="independent"), 100)
+    final = states[-1]
+    metrics = final["metrics"]
+    classified = [e for e in events if e["type"] == "movement_productivity"]
+    assert metrics["nonproductiveMovement"] == sum(
+        not e["payload"]["productive"] for e in classified
+    )
+    assert metrics["productiveMovement"] == sum(
+        e["payload"]["productive"] for e in classified
+    )
+    assert (
+        metrics["distance"]
+        == metrics["nonproductiveMovement"]
+        + metrics["productiveMovement"]
+        + metrics["unclassifiedMovement"]
+    )
+    counters = final["communicationCounters"]
+    assert metrics["messagesAttempted"] == sum(counters["attemptedMessages"].values())
+    assert metrics["messagesDelivered"] == sum(counters["deliveredMessages"].values())
+    assert metrics["bytesAttempted"] == sum(counters["attemptedBytes"].values())
+    assert metrics["bytesDelivered"] == sum(counters["deliveredBytes"].values())
+    assert metrics["messagesDelivered"] == sum(
+        e["type"] == "message_delivered" for e in events
+    )
+
+
+def test_batched_advance_preserves_every_tick_measurement_and_final_hash():
+    async def run():
+        first, second = await Engine().open(), await Engine().open()
+        try:
+            cfg = fixture_config(strategy="independent")
+            await first.call("initialize", cfg)
+            await second.call("initialize", cfg)
+            for _ in range(10):
+                sequential = await first.call("advance", {"ticks": 1})
+            batched = await second.call("advance", {"ticks": 10})
+            assert [m["tick"] for m in batched["measurements"]] == list(range(1, 11))
+            assert (
+                batched["snapshot"]["stateHash"] == sequential["snapshot"]["stateHash"]
+            )
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(run())
+
+
+def test_adaptive_peer_only_ablation_does_not_accept_coordinator_assignments():
+    _, states, events = execute(
+        fixture_config(strategy="adaptive", adaptiveCoordinatorEnabled=False), 60
+    )
+    assert states[-1]["metrics"]["distance"] > 0
+    assert any(e["type"] == "bid" for e in events)
+    assert not any(e["type"] == "assignment_acknowledged" for e in events)
+
+
+def test_charging_replaces_movement_and_sensing_and_agent_ledgers_balance():
+    cfg = fixture_config(
+        strategy="independent",
+        energy={
+            "capacity": 15000,
+            "reserve": 1000,
+            "transmitCostPerByte": 0,
+            "receiveCostPerByte": 0,
+        },
+    )
+    _, states, _ = execute(cfg, 150)
+    charged = False
+    for previous, current in zip(states, states[1:]):
+        for old, new in zip(previous["agents"], current["agents"]):
+            assert (
+                new["energy"] + new["energySpent"] - new["energyCharged"]
+                == new["capacity"]
+            )
+            if new["energyCharged"] > old["energyCharged"]:
+                charged = True
+                assert new["position"] == old["position"]
+                assert new["energyLedger"].get("sensing", 0) == old["energyLedger"].get(
+                    "sensing", 0
+                )
+                assert new["energyLedger"].get("movement", 0) == old[
+                    "energyLedger"
+                ].get("movement", 0)
+    assert charged
+
+
+def test_native_protocol_rejects_invalid_fault_without_crashing():
+    async def run():
+        engine = await Engine().open()
+        try:
+            await engine.call("initialize", fixture_config())
+            with pytest.raises(ValueError, match="missing agent"):
+                await engine.call(
+                    "queue_fault", {"type": "agent_failure", "tick": 1, "agentId": 1000}
+                )
+            assert (await engine.call("advance", {"ticks": 1}))["snapshot"]["tick"] == 1
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
+def test_frontier_components_are_known_free_unknown_boundaries_with_stable_ids():
+    _, states, _ = execute(fixture_config(strategy="independent"), 40)
+    for state in states:
+        for agent in state["agents"]:
+            for region in agent["regions"]:
+                assert region["id"].startswith(f"a{agent['id']}-f")
+                for cell in region["cells"]:
+                    assert agent["map"][cell] == 0
+                    x, y = cell % 16, cell // 16
+                    neighbors = [
+                        ny * 16 + nx
+                        for nx, ny in ((x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y))
+                        if 0 <= nx < 16 and 0 <= ny < 16
+                    ]
+                    assert any(agent["map"][p] == -1 for p in neighbors)
+
+
+@pytest.mark.parametrize("strategy", ["greedy", "hungarian", "adaptive"])
+def test_acknowledged_coordinator_domain_has_unique_agents_and_frontier_components(
+    strategy,
+):
+    _, states, events = execute(fixture_config(strategy=strategy), 150)
+    assert any(e["type"] == "assignment_acknowledged" for e in events)
+    for state in states:
+        claims = state["coordinatorClaims"]
+        assert len({c["owner"] for c in claims}) == len(claims)
+        assert len({c["cell"] for c in claims}) == len(claims)
+        known = state["coordinatorMap"]
+        frontier = set()
+        neighbors = lambda p: [
+            y * 16 + x
+            for x, y in (
+                (p % 16, p // 16 - 1),
+                (p % 16 + 1, p // 16),
+                (p % 16, p // 16 + 1),
+                (p % 16 - 1, p // 16),
+            )
+            if 0 <= x < 16 and 0 <= y < 16
+        ]
+        for cell, value in enumerate(known):
+            if value == 0 and any(known[p] == -1 for p in neighbors(cell)):
+                frontier.add(cell)
+        while frontier:
+            group = {frontier.pop()}
+            pending = list(group)
+            while pending:
+                for cell in neighbors(pending.pop()):
+                    if cell in frontier:
+                        frontier.remove(cell)
+                        group.add(cell)
+                        pending.append(cell)
+            assert sum(c["cell"] in group for c in claims) <= 1

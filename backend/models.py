@@ -110,6 +110,7 @@ class ScenarioConfig(BaseModel):
     targets: list[Literal[0, 1]] | None = None
     zones: list[int] | None = None
     strategy: Strategy = "adaptive"
+    adaptiveCoordinatorEnabled: bool = True
     planner: Literal["reservations", "cbs"] = "reservations"
     pathfinder: Literal["astar", "bfs"] = "astar"
     reservationHorizon: int = Field(16, ge=4, le=64)
@@ -133,6 +134,21 @@ class ScenarioConfig(BaseModel):
         if not self.seed.isdecimal() or not 0 <= int(self.seed) < 2**64:
             raise ValueError("seed must encode an unsigned 64-bit integer")
         size = self.width * self.height
+        net = self.energy.chargingRate - self.energy.chargingRate // 4
+        queue_cost = (
+            ((self.energy.capacity + net - 1) // net)
+            * (self.agentCount - 1)
+            * (self.energy.waitingCost + self.energy.sensingCost)
+        )
+        if (
+            queue_cost
+            + size * (self.energy.movementCost + self.energy.sensingCost)
+            + self.energy.reserve
+            > 2**53 - 1
+        ):
+            raise ValueError(
+                "derived energy estimates exceed the JSON safe-integer range"
+            )
         allowed = {
             "gain",
             "priority",
@@ -186,6 +202,10 @@ class ScenarioConfig(BaseModel):
                     raise ValueError("target and zone arrays must match map size")
             if self.zones is not None and any(not 0 <= v <= 100 for v in self.zones):
                 raise ValueError("zone priorities must be between 0 and 100")
+            if self.zones is not None and any(
+                v and self.map[i] for i, v in enumerate(self.zones)
+            ):
+                raise ValueError("zone markers must occupy free cells")
             if self.targets is not None and any(
                 v and self.map[i] for i, v in enumerate(self.targets)
             ):

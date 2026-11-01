@@ -47,6 +47,18 @@ test("configure, explore, inspect, replay, and validate a map", async ({
   await page
     .getByRole("button", { name: "Scenario builder", exact: true })
     .click();
+  await page.getByRole("button", { name: "free", exact: true }).click();
+  const editor = page.getByRole("application", {
+    name: "Custom map editor",
+    exact: true,
+  });
+  await editor.press("Home");
+  await editor.press("ArrowRight");
+  await editor.press("Enter");
+  await expect(page.getByRole("status")).toHaveText("Cell (1, 0), free.");
+  await page.getByRole("button", { name: "wall", exact: true }).click();
+  await editor.press("Space");
+  await expect(page.getByRole("status")).toHaveText("Cell (1, 0), blocked.");
   await page
     .getByLabel("Scenario name", { exact: true })
     .fill("Browser test map");

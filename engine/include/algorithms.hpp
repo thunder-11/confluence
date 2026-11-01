@@ -70,6 +70,15 @@ struct SearchResult {
     int expanded=0;
     bool exhausted=false;
 };
+// Optimistic sensor footprint: unknown may be free, but known walls occlude.
+inline std::vector<int> estimated_sensor_footprint(const Grid& known,int start,int radius) {
+    std::vector<int> result;if(!known.free(start))return result;
+    std::queue<std::pair<int,int>> open;std::set<int> seen;open.push({start,0});seen.insert(start);
+    while(!open.empty()){auto [cell,depth]=open.front();open.pop();result.push_back(cell);
+        if(depth==radius||known.cells[cell]==1)continue;
+        for(int next:known.neighbors(cell))if(seen.insert(next).second)open.push({next,depth+1});
+    }return result;
+}
 inline std::vector<int> distances(const Grid& g,int start) {
     std::vector<int> d(g.size(),INF);
     if(!g.free(start)) return d;
@@ -234,7 +243,7 @@ inline Conflict first_conflict(const std::vector<std::vector<int>>& paths) {
         }
     return {};
 }
-struct CBSResult {std::vector<std::vector<int>> paths;int high=0,low=0;bool exhausted=false;};
+struct CBSResult {std::vector<std::vector<int>> paths;std::vector<Constraint> constraintTrace;int high=0,low=0,constraintsConsidered=0;bool exhausted=false;};
 inline CBSResult cbs(const Grid& g,const std::vector<int>& starts,const std::vector<int>& goals,
     int horizon=64,int high_budget=5000,int low_budget=100000,const std::vector<Grid>* agent_graphs=nullptr) {
     CBSResult result;
@@ -245,7 +254,7 @@ inline CBSResult cbs(const Grid& g,const std::vector<int>& starts,const std::vec
     MinHeap<Node,Before> open;Node root;
     for(int a=0;a<static_cast<int>(starts.size());++a) {
         const auto& graph=agent_graphs?agent_graphs->at(a):g;
-        auto p=space_time(graph,starts[a],goals[a],horizon,{}, {},a,std::max(0,low_budget-result.low));result.low+=p.expanded;
+        auto p=space_time(graph,starts[a],goals[a],horizon,{}, {},a,low_budget);result.low+=p.expanded;
         if(p.path.empty()) {result.exhausted=p.exhausted;return result;}
         root.cost+=static_cast<int>(p.path.size())-1;root.paths.push_back(std::move(p.path));
     }
@@ -256,8 +265,9 @@ inline CBSResult cbs(const Grid& g,const std::vector<int>& starts,const std::vec
         for(int agent:{c.a,c.b}) {
             Node child=n;child.id=next++;
             child.constraints.push_back({agent,c.time,c.edge?(agent==c.a?c.a0:c.b0):-1,agent==c.a?c.a1:c.b1});
+            ++result.constraintsConsidered;if(result.constraintTrace.size()<512)result.constraintTrace.push_back(child.constraints.back());
             const auto& graph=agent_graphs?agent_graphs->at(agent):g;
-            auto p=space_time(graph,starts[agent],goals[agent],horizon,{},child.constraints,agent,std::max(0,low_budget-result.low));
+            auto p=space_time(graph,starts[agent],goals[agent],horizon,{},child.constraints,agent,low_budget);
             result.low+=p.expanded;
             if(p.exhausted) {result.exhausted=true;return result;}
             if(p.path.empty()) continue;

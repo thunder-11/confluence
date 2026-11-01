@@ -29,9 +29,7 @@ def _summarize(values, bootstrap):
     interval = None
     if bootstrap:
         rng = random.Random(2026)
-        samples = sorted(
-            statistics.mean(rng.choices(values, k=n)) for _ in range(10000)
-        )
+        samples = sorted(sum(rng.choices(values, k=n)) / n for _ in range(10000))
         interval = [samples[249], samples[9749]]
     quartiles = statistics.quantiles(values, n=4, method="inclusive")
     return {

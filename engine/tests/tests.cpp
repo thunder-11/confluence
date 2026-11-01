@@ -29,11 +29,24 @@ int main(){
     Grid small(3,3,0);auto joint=cbs(small,{3,5},{5,3},12);require(!joint.paths.empty(),"CBS resolves crossing");require(first_conflict(joint.paths).a<0,"CBS conflict free");
     int sum=0;for(auto& p:joint.paths)sum+=static_cast<int>(p.size())-1;require(sum==6,"CBS known optimum");
     auto limited=cbs(small,{3,5},{5,3},12,0);require(limited.exhausted,"CBS budget reported");
-    auto lowLimited=cbs(small,{3,5},{5,3},12,5000,3);require(lowLimited.exhausted&&lowLimited.low<=3,"CBS low-level budget applies to complete replan");
+    auto lowLimited=cbs(small,{3,5},{5,3},12,5000,1);require(lowLimited.exhausted&&lowLimited.low<=1,"CBS low-level budget applies to each replan");
     Reservations r;r.reserve({1,1,1},3);auto timed=space_time(small,0,2,6,r);require(!timed.path.empty(),"reservation detour");
     Grid detour(9,9,0);for(int y=0;y<8;++y)detour.cells[y*9+4]=1;
     auto prefix=space_time(detour,3,5,4,{}, {},0,100000,true);
     require(prefix.path.size()==5&&prefix.path[1]==12,"rolling prefix advances around a long wall");
+    Grid footprint(5,5);footprint.cells[12]=0;footprint.cells[7]=1;auto visible=estimated_sensor_footprint(footprint,12,2);
+    require(std::find(visible.begin(),visible.end(),2)==visible.end(),"known wall occludes gain footprint");
+    require(std::find(visible.begin(),visible.end(),6)!=visible.end(),"alternative sensor route remains represented");
+    std::vector<std::vector<Candidate>> rows(2,std::vector<Candidate>(2));
+    int matrix[2][2]={{1,2},{2,100}};for(int a=0;a<2;++a)for(int t=0;t<2;++t){rows[a][t].feasible=true;rows[a][t].distance=matrix[a][t];}
+    require(match(rows,"greedy")==std::vector<int>({0,1}),"genuine greedy pair ordering");
+    require(match(rows,"hungarian")==std::vector<int>({1,0}),"Hungarian improves fixed matching over greedy fixture");
+    for(auto& row:rows)for(auto& c:row){c.feasible=false;c.score=-5;}
+    require(match(rows,"hungarian")==std::vector<int>({-1,-1}),"forbidden pairs use idle columns");
+    rows[0][0].feasible=true;require(match(rows,"adaptive")[0]==-1,"negative adaptive utility prefers idle");
+    require(plan(PlanningView{small},PathRequest{-1,0,true}).status==ResultStatus::INVALID_INPUT,"restricted planner validates requests");
+    require(allocate({rows,"invalid"}).status==ResultStatus::INVALID_INPUT,"restricted allocator validates strategy");
+    require(!joint.constraintTrace.empty()&&joint.constraintsConsidered>=static_cast<int>(joint.constraintTrace.size()),"CBS exposes bounded constraint traces");
     Knowledge k(3,3);require(k.merge(0,1,3,0),"merge observation");require(!k.merge(0,0,2,2)&&k.grid.cells[0]==1,"stale merge rejected");require(k.merge(0,0,4,1),"obstacle reopening");
     k.merge_peer(2,0,"FAILED",5,0);require(!k.planning_grid().free(0)&&k.grid.free(0),"observed failure blocks planning without corrupting static map");
     k.merge_peer(2,0,"ACTIVE",6,0);require(k.planning_grid().free(0),"observed restoration unblocks planning");

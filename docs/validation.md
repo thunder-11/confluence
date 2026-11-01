@@ -2,6 +2,8 @@
 
 This document records checks actually performed. It does not certify flawless behavior, universal completion, or an adaptive-policy advantage.
 
+Final delivered engine: `ac5c99aba6e3f1b620dcbdc41a8f0ee3bc2207da5202a09ee68d033ad353c477`. Final verification passes 52 pytest tests, 16,995 native assertions, and the production TypeScript/Vite build. Browser verification confirms tick-zero replay contains only its two recorded initialization/discovery events; the complete event log follows the selected replay tick. The final preview emits no browser console errors. The temporary viewport override was reset. [Recorded-state screenshot](studio.png).
+
 ## Correctness and integration
 
 The release uses the native C++20 engine, FastAPI subprocess orchestration, SQLite persistence, and the built React dashboard. There is no Python solver or browser simulation substitute.

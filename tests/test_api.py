@@ -94,6 +94,31 @@ def test_websocket_initial_snapshot(client):
         assert item["payload"]["snapshot"]["tick"] == 0
 
 
+def test_websocket_deltas_reconstruct_authoritative_snapshots(client):
+    from backend.deltas import apply_patch
+    import copy
+
+    scenario = generate(client)
+    run = client.post("/api/v1/runs", json={"scenarioId": scenario["id"]}).json()
+    with client.websocket_connect(f"/api/v1/runs/{run['id']}/stream") as socket:
+        initial = socket.receive_json()
+        reconstructed = initial["payload"]["snapshot"]
+        sequence = initial["sequence"]
+        for _ in range(3):
+            stepped = client.post(
+                f"/api/v1/runs/{run['id']}/commands", json={"command": "step"}
+            ).json()
+            delta = socket.receive_json()
+            assert delta["type"] == "delta"
+            assert delta["payload"]["baseSequence"] == sequence
+            assert delta["sequence"] == sequence + 1
+            reconstructed = apply_patch(
+                copy.deepcopy(reconstructed), delta["payload"]["patch"]
+            )
+            sequence = delta["sequence"]
+            assert reconstructed == stepped["snapshot"]
+
+
 def test_custom_map_rejects_overlapping_starts():
     with pytest.raises(ValueError):
         ScenarioConfig(

@@ -83,6 +83,7 @@ export interface Config {
   pathfinder?: string;
   reservationHorizon?: number;
   adaptiveWeights?: Record<string, number>;
+  adaptiveCoordinatorEnabled?: boolean;
   failureProbabilityPerTick?: number;
   scenarioFamily?:
     | "normal"
@@ -155,8 +156,23 @@ export interface Agent {
   communication: string;
   decisions: Decision[];
   features: Record<string, number>;
-  claims: { cell: number; owner: number; score: number; expires: number }[];
+  claims: {
+    cell: number;
+    owner: number;
+    score: number;
+    expires: number;
+    confirmed?: boolean;
+  }[];
+  coordinatorAgeTicks?: number | null;
+  peerFreshness?: { agentId: number; ageTicks: number; suspected: boolean }[];
+  recentRejections?: {
+    tick: number;
+    from: number;
+    to: number;
+    reason: string;
+  }[];
   energySpent: number;
+  energyCharged?: number;
   knownTargets?: number[];
   knownZones?: number[];
   visitedCells?: number[];
@@ -182,6 +198,12 @@ export interface Agent {
   }[];
 }
 export interface Snapshot {
+  coordinatorClaims?: {
+    cell: number;
+    owner: number;
+    expiry: number;
+    acknowledgedTick: number;
+  }[];
   truthZones?: number[];
   unionZones?: number[];
   coordinatorZones?: number[];

@@ -5,6 +5,7 @@ import sqlite3
 import zlib
 from contextlib import contextmanager
 from .deltas import difference, apply_patch
+from .measurements import normalize_measurement
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = """
@@ -42,12 +43,50 @@ class Store:
                     "ALTER TABLE agent_snapshots ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'"
                 )
             db.execute("PRAGMA user_version=2")
-            db.execute(
-                "UPDATE simulation_runs SET status='FAILED',termination_reason='SERVER_RESTART',finished_at=CURRENT_TIMESTAMP WHERE status IN ('READY','RUNNING','PAUSED')"
-            )
+            interrupted = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id,tick FROM simulation_runs WHERE status IN ('READY','RUNNING','PAUSED')"
+                )
+            ]
             db.execute(
                 "UPDATE experiment_batches SET status='INTERRUPTED' WHERE status='RUNNING'"
             )
+        for run in interrupted:
+            snapshot = self.snapshot(run["id"])
+            sequence = self.query(
+                "SELECT COALESCE(MAX(sequence),0)+1 AS n FROM events WHERE run_id=?",
+                (run["id"],),
+                one=True,
+            )["n"]
+            event = {
+                "sequence": sequence,
+                "tick": run["tick"],
+                "type": "terminal",
+                "agentId": None,
+                "payload": {"reason": "FAILED", "trigger": "SERVER_RESTART"},
+            }
+            if snapshot is not None:
+                self.save_tick(
+                    run["id"], snapshot, [event], "FAILED", reason="SERVER_RESTART"
+                )
+            else:
+                with self.connect() as db:
+                    db.execute(
+                        "UPDATE simulation_runs SET status='FAILED',termination_reason='SERVER_RESTART',finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (run["id"],),
+                    )
+                    db.execute(
+                        "INSERT INTO events VALUES(?,?,?,?,?,?)",
+                        (
+                            run["id"],
+                            sequence,
+                            run["tick"],
+                            "terminal",
+                            None,
+                            json.dumps(event["payload"]),
+                        ),
+                    )
 
     @contextmanager
     def connect(self):
@@ -71,7 +110,7 @@ class Store:
         with self.connect() as db:
             db.execute(sql, args)
 
-    def save_tick(self, run_id, snapshot, events, status=None):
+    def save_tick(self, run_id, snapshot, events, status=None, reason=None):
         tick, width = snapshot["tick"], snapshot["width"]
         state = status or snapshot["status"]
         terminal = state in {"COMPLETED", "EXHAUSTED", "TIMED_OUT", "STOPPED", "FAILED"}
@@ -101,7 +140,7 @@ class Store:
                     tick,
                     state,
                     snapshot["stateHash"],
-                    state if terminal else None,
+                    (reason or state) if terminal else None,
                     terminal,
                     run_id,
                 ),
@@ -159,24 +198,7 @@ class Store:
                     )
             if terminal:
                 for name, value in snapshot["metrics"].items():
-                    measurement = (
-                        "MEASURED"
-                        if value is not None
-                        else (
-                            "CENSORED" if snapshot.get("recovery") else "NOT_APPLICABLE"
-                        )
-                    )
-                    if value is None and name == "explorationCompletionTick":
-                        measurement = "CENSORED"
-                    if (
-                        value is None
-                        and name in {"assignmentRecoveryTicks", "progressRecoveryTicks"}
-                        and not any(
-                            e["unfinishedTask"] >= 0
-                            for e in snapshot.get("recovery", [])
-                        )
-                    ):
-                        measurement = "NOT_APPLICABLE"
+                    value, measurement = normalize_measurement(name, value, snapshot)
                     specific = {
                         "coverage": "percent",
                         "mappingCoverage": "percent",
@@ -185,6 +207,10 @@ class Store:
                         "observedObstacleCells": "cells",
                         "agentUtilization": "percent",
                         "distance": "steps",
+                        "nonproductiveMovement": "steps",
+                        "productiveMovement": "steps",
+                        "unclassifiedMovement": "steps",
+                        "energyPerObservedFreeCell": "milliunits/cell",
                         "observedCells": "cells",
                         "reachableCells": "cells",
                         "targetsFound": "targets",

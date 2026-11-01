@@ -1,5 +1,6 @@
 #pragma once
 #include "allocation.hpp"
+#include "interfaces.hpp"
 #include "json.hpp"
 #include <chrono>
 #include <deque>
@@ -15,7 +16,7 @@ inline json defaults() {
     return {{"schemaVersion",1},{"seed","42"},{"width",64},{"height",64},{"agentCount",4},{"obstacleDensity",.32},{"targetCount",20},{"sensorRadius",2},{"allowDisconnected",false},{"starts",json::array()},{"chargingStations",json::array()},
         {"communication",{{"rangeCells",256},{"delayMinTicks",1},{"delayMaxTicks",1},{"dropProbability",0.0},{"heartbeatPeriodTicks",5},{"heartbeatTimeoutTicks",15}}},
         {"energy",{{"capacity",100000},{"movementCost",1000},{"sensingCost",100},{"waitingCost",20},{"transmitCostPerByte",1},{"receiveCostPerByte",1},{"chargingRate",5000},{"reserve",10000}}},
-        {"maxTicks",10000},{"faultSchedule",json::array()},{"strategy","adaptive"},{"planner","reservations"},{"pathfinder","astar"},{"reservationHorizon",16}};
+        {"maxTicks",10000},{"faultSchedule",json::array()},{"strategy","adaptive"},{"adaptiveCoordinatorEnabled",true},{"planner","reservations"},{"pathfinder","astar"},{"reservationHorizon",16}};
 }
 struct PeerObservation {int position=0,tick=-1,source=-1;std::string status="ACTIVE";};
 struct Knowledge {
@@ -49,7 +50,8 @@ struct Knowledge {
 struct Agent {
     int id=0,pos=0,task=-1,assignedAt=-100,lease=0,distance=0,blocked=0,success=0,resolved=0;
     int lastBase=-1000,baseOfferEpoch=-1,lastProgress=0,queueTick=-1;
-    int64_t energy=0,spent=0;
+    int64_t energy=0,spent=0,energyCharged=0;
+    int pendingMovementTick=-1;
     std::map<std::string,int64_t> energyLedger;
     std::string status="ACTIVE",activity="IDLE";
     Knowledge knowledge;
@@ -63,6 +65,7 @@ struct Agent {
     std::map<int,int> pendingBids;
     std::map<int,int> suspected;
     std::vector<json> decisions;
+    std::deque<json> rejections;
     json chosen=json::object();
     json alternatives=json::array();
     int alternativesTick=-1;
@@ -103,7 +106,7 @@ class Simulation {
     std::map<int,Report> reports;
     MinHeap<Message,MessageBefore> messages;
     std::map<int,std::tuple<int,int,int>> baseOffers; // agent -> task,epoch,expiry
-    std::map<int,int> baseClaims;
+    std::map<int,std::tuple<int,int,int>> baseClaims; // task -> owner,expiry,acknowledged tick
     std::string jointPhase="IDLE";
     int jointEpoch=0,jointDeadline=0,jointRetry=0;
     std::vector<int> jointMembers;
@@ -125,6 +128,10 @@ class Simulation {
     std::string status="READY";
     json events=json::array();
     int64_t totalDistance=0,repeated=0,prevented=0,bytesAttempted=0,bytesDelivered=0,replans=0,expanded=0,cbsExpanded=0,fallbacks=0,churn=0,charged=0;
+    int64_t nonproductiveMoves=0,productiveMoves=0,unclassifiedMoves=0,attemptedMessages=0,deliveredMessages=0;
+    std::map<std::string,int64_t> attemptedByType,deliveredByType,attemptedBytesByType,deliveredBytesByType;
+    std::set<std::pair<int,int>> duplicatePairs;
+    int64_t duplicateClaimTicks=0,duplicateClaimEpisodes=0;
     double lastTickMs=0,sensingMs=0,communicationMs=0,allocationMs=0,planningMs=0;
 
     void event(const std::string& type,json data=json::object(),int id=-1) {
@@ -154,7 +161,7 @@ class Simulation {
     bool available(const Agent& a)const {
         return a.status=="ACTIVE"&&!a.parking&&!a.jointAwait&&a.jointPath.empty()&&a.activity!="CHARGING"&&a.activity!="RETURNING"&&a.activity!="QUEUED";
     }
-    bool base_fresh(const Agent& a)const {return tick>=a.coordinatorBlockedUntil&&tick-a.lastBase<=config["communication"]["heartbeatTimeoutTicks"].get<int>();}
+    bool base_fresh(const Agent& a)const {return !(config["strategy"]=="adaptive"&&!config.value("adaptiveCoordinatorEnabled",true))&&tick>=a.coordinatorBlockedUntil&&tick-a.lastBase<=config["communication"]["heartbeatTimeoutTicks"].get<int>();}
     void receive_claim(Agent& a,int cell,int owner,int score,int expiry,bool confirmed){
         if(expiry<=tick)return;auto old=a.claims.find(cell);bool replace=old==a.claims.end()||std::get<2>(old->second)<=tick;
         if(!replace){
@@ -242,13 +249,23 @@ class Simulation {
     }
     void sense(Agent& a,bool charge=true) {
         if(a.status!="ACTIVE"||a.activity=="CHARGING")return;
+        // Decide service eligibility from the boundary state before charging replaces sensing.
+        if(charge&&station(a.pos)&&a.energy<e("capacity")){
+            if(a.activity=="RETURNING"||a.activity=="QUEUED")return;
+            if(a.activity=="IDLE"&&a.task<0){
+                bool waiting=false;auto requests=stationRequests.find(a.pos);
+                if(requests!=stationRequests.end())for(const auto& [id,when]:requests->second)if(id!=a.id&&agents[id].status=="ACTIVE")waiting=true;
+                if(!waiting){bool feasible=false;for(const auto& c:candidates(a))if(c.feasible)feasible=true;if(!feasible)return;}
+            }
+        }
         if(charge&&!spend(a,e("sensingCost"),"sensing"))return;
+        int newKnowledge=0;
         std::queue<std::pair<int,int>> q;std::set<int> seen;q.push({a.pos,0});seen.insert(a.pos);
         while(!q.empty()) {
             auto [p,d]=q.front();q.pop();
             a.knowledge.merge(p,truth.cells[p],tick,a.id,targets[p],zones[p]);
             a.sensedCells.insert(p);
-            mapped[p]=true;
+            if(!mapped[p])++newKnowledge;mapped[p]=true;
             for(const auto& peer:agents)if(peer.pos==p)a.knowledge.merge_peer(peer.id,p,peer.status,tick,a.id);
             if(!observed[p]&&truth.free(p)) {observed[p]=true;a.lastProgress=tick;
                 for(const auto& [failed,when]:failures)if(reassignedFailures.count(failed)&&!recoveredFailures.count(failed)&&recoveryOwners[failed]==a.id&&a.task>=0&&related(a.knowledge,a.task,failedTasks[failed])){
@@ -258,6 +275,10 @@ class Simulation {
             if(targets[p]&&discovery[p]<0){discovery[p]=tick;event("target_discovered",{{"cell",p},{"targetId","target-"+std::to_string(p)}},a.id);}
             if(d>=config["sensorRadius"].get<int>()||!truth.free(p))continue;
             for(int v:truth.neighbors(p))if(!seen.count(v)){seen.insert(v);q.push({v,d+1});}
+        }
+        if(a.pendingMovementTick>=0){
+            if(newKnowledge)++productiveMoves;else ++nonproductiveMoves;
+            event("movement_productivity",{{"movementTick",a.pendingMovementTick},{"newTeamCells",newKnowledge},{"productive",newKnowledge>0}},a.id);a.pendingMovementTick=-1;
         }
     }
     bool link(int from,int to)const {
@@ -274,7 +295,7 @@ class Simulation {
         int serial=++messageSeq;
         const int bytes=static_cast<int>(payload.dump().size())+32;
         if(from>=0&&!optional_spend(agents[from],static_cast<int64_t>(bytes)*e("transmitCostPerByte"),"transmit"))return false;
-        bytesAttempted+=bytes;if(from>=0){++agents[from].attempted;if(kind=="report")agents[from].communicationWindow[serial]={tick,false};}
+        bytesAttempted+=bytes;++attemptedMessages;++attemptedByType[kind];attemptedBytesByType[kind]+=bytes;if(from>=0){++agents[from].attempted;if(kind=="report")agents[from].communicationWindow[serial]={tick,false};}
         uint64_t key=mix(seed^mix(tick)^mix(static_cast<uint64_t>(from+2)*97+to+2));
         for(unsigned char c:kind)key=mix(key^c);
         bool drop=static_cast<double>(key%1000000)/1000000.0<config["communication"]["dropProbability"].get<double>();
@@ -314,11 +335,18 @@ class Simulation {
         while(!messages.empty()) {
             auto m=messages.pop();if(m.due>tick){messages.push(std::move(m));break;}
             if(m.receiver>=0 && (!active(m.receiver)||!optional_spend(agents[m.receiver],static_cast<int64_t>(m.bytes)*e("receiveCostPerByte"),"receive")))continue;
-            bytesDelivered+=m.bytes;
+            bytesDelivered+=m.bytes;++deliveredMessages;++deliveredByType[m.kind];deliveredBytesByType[m.kind]+=m.bytes;
             event("message_delivered",{{"kind",m.kind},{"from",m.sender},{"to",m.receiver},{"bytes",m.bytes}});
             auto& p=m.payload;
             if(finishAt>=0&&m.kind!="report"&&m.kind!="receipt")continue;
-            if(m.kind=="joint_ready"&&m.receiver<0){
+            if(m.kind=="joint_prepare"&&m.receiver>=0){
+                auto& a=agents[m.receiver];int epoch=p["epoch"];
+                if(a.status=="ACTIVE"&&epoch>=a.jointEpoch&&tick<=p["deadline"].get<int>()){
+                    a.jointAwait=true;a.jointEpoch=epoch;a.jointDeadline=p["deadline"];a.jointGoal=a.task>=0&&a.activity!="CHARGING"?a.task:a.pos;
+                    auto payload=report_payload(a,-1);payload["epoch"]=epoch;payload["goal"]=a.jointGoal;payload["planningMap"]=a.knowledge.planning_grid().cells;
+                    send(a.id,-1,"joint_ready",payload);
+                }
+            }else if(m.kind=="joint_ready"&&m.receiver<0){
                 if(jointPhase=="PREPARING"&&p["epoch"].get<int>()==jointEpoch){jointReady[m.sender]=p;merge_records(base,p["records"]);merge_peers(base,p);}
             } else if(m.kind=="joint_route"&&m.receiver>=0){
                 auto& a=agents[m.receiver];auto path=p["path"].get<std::vector<int>>();bool valid=a.jointAwait&&a.jointEpoch==p["epoch"].get<int>()&&!path.empty()&&path.front()==a.pos&&a.jointGoal==p["goal"].get<int>();
@@ -337,7 +365,12 @@ class Simulation {
                 auto& a=agents[m.receiver];if(a.jointEpoch==p["epoch"].get<int>()){a.jointAwait=false;a.jointPath.clear();a.jointStart=-1;}
             } else if(m.kind=="report") {
                 if(m.receiver<0){merge_records(base,p["records"]);merge_peers(base,p);base.merge_peer(m.sender,p["pos"],p["status"],p["tick"],m.sender);Report r;r.tick=p["tick"];r.pos=p["pos"];r.task=p["task"];r.energy=p["energy"];r.status=p["status"];r.activity=p.value("activity","IDLE");r.lease=p["lease"];r.success=p.value("success",0);r.resolved=p.value("resolved",0);r.distance=p.value("distance",0);r.attempted=p.value("attempted",0);r.delivered=p.value("delivered",0);r.communication=p.value("communicationQuality",.5);r.workload=p.value("workload",0.0);r.ready=p.value("available",true);
-                    if(!reports.count(m.sender)||r.tick>=reports[m.sender].tick)reports[m.sender]=r;}
+                    if(!reports.count(m.sender)||r.tick>=reports[m.sender].tick){reports[m.sender]=r;
+                        for(auto it=baseClaims.begin();it!=baseClaims.end();){auto& [owner,expiry,ackTick]=it->second;
+                            if(owner==m.sender&&r.tick>ackTick){if(r.status!="ACTIVE"||r.task!=it->first||r.lease<=tick){it=baseClaims.erase(it);continue;}expiry=r.lease;}
+                            ++it;
+                        }
+                    }}
                 else {auto& a=agents[m.receiver];merge_records(a.knowledge,p["records"]);merge_peers(a.knowledge,p);a.knowledge.merge_peer(m.sender,p["pos"],p["status"],p["tick"],m.sender);a.peerSeen[m.sender]=tick;a.peerTasks[m.sender]=p["task"];
                     if(p["task"].get<int>()>=0&&p.value("activity","EXPLORING")=="EXPLORING"&&p["lease"].get<int>()>tick){int cell=p["task"];receive_claim(a,cell,m.sender,p.value("score",0),p["lease"].get<int>(),true);}}
                 send(m.receiver,m.sender,"receipt",{{"reportSeq",m.seq},{"records",p["records"]}});
@@ -360,13 +393,21 @@ class Simulation {
             } else if(m.kind=="ack"&&m.receiver<0) {
                 auto it=baseOffers.find(m.sender);
                 if(it!=baseOffers.end()&&std::get<1>(it->second)==p["epoch"].get<int>()&&tick-p["epoch"].get<int>()<=3){
-                    baseClaims[p["task"]]=m.sender;event("assignment_acknowledged",{{"task",p["task"]},{"epoch",p["epoch"]}},m.sender);
+                    int cell=p["task"];if(!is_frontier(base,cell)){event("assignment_rejected",{{"task",cell},{"reason","STALE_FRONTIER"}},m.sender);continue;}bool conflict=false;
+                    for(const auto& [old,claim]:baseClaims)if(std::get<0>(claim)!=m.sender&&std::get<1>(claim)>tick&&related(base,old,cell))conflict=true;
+                    if(conflict){event("assignment_rejected",{{"task",cell},{"reason","ACKNOWLEDGED_DOMAIN_CONFLICT"}},m.sender);continue;}
+                    for(auto claim=baseClaims.begin();claim!=baseClaims.end();)if(std::get<0>(claim->second)==m.sender)claim=baseClaims.erase(claim);else ++claim;
+                    baseClaims[cell]={m.sender,p["epoch"].get<int>()+18,tick};event("assignment_acknowledged",{{"task",p["task"]},{"epoch",p["epoch"]}},m.sender);
                     send(-1,m.sender,"commit",p);
                 }
             } else if(m.kind=="commit"&&m.receiver>=0) {
                 auto& a=agents[m.receiver];int epoch=p["epoch"];
                 if(epoch==a.baseOfferEpoch&&tick-epoch<=3&&available(a)&&is_frontier(a.knowledge,p["task"])){
                     auto c=make_candidate(a.knowledge,a.pos,a.energy,p["task"],0,a);if(assign(a,c,"coordinator_commit"))a.pendingBids.clear();a.lastBase=tick;a.pendingOffer=-1;a.coordinatorBlockedUntil=-1;a.lastCoordinatorResponse=tick;
+                }
+            } else if(m.kind=="revoke"&&m.receiver>=0){
+                auto& a=agents[m.receiver];if(a.task==p["task"].get<int>()&&a.assignedAt<=p["revocationTick"].get<int>()){
+                    release_task(a,p.value("reason","COORDINATOR_REVOKED"));send(a.id,-1,"report",report_payload(a,-1));
                 }
             } else if(m.kind=="yield_request"&&m.receiver>=0){
                 auto& a=agents[m.receiver];if(tick-p["tick"].get<int>()<=5&&a.task<0&&available(a))stage_for_congestion(a);
@@ -393,9 +434,7 @@ class Simulation {
         int64_t cost=static_cast<int64_t>(c.distance+home)*(e("movementCost")+e("sensingCost"))+e("reserve")+e("sensingCost")+queue_buffer();
         if(cost>energy)return c;c.energy=static_cast<int>(cost);c.feasible=true;
         int radius=config["sensorRadius"],maxFoot=1+2*radius*(radius+1),age=0,count=0,priority=0;
-        for(int dy=-radius;dy<=radius;++dy)for(int dx=-radius;dx<=radius;++dx)if(std::abs(dx)+std::abs(dy)<=radius){
-            int x=cell%k.grid.width+dx,y=cell/k.grid.width+dy;
-            if(x<0||y<0||x>=k.grid.width||y>=k.grid.height)continue;int p=y*k.grid.width+x;
+        for(int p:estimated_sensor_footprint(k.grid,cell,radius)){
             if(k.grid.cells[p]<0)++c.gain;else{age+=std::max(0,tick-k.times[p]);++count;priority=std::max(priority,k.priority[p]);}
         }
         int attempted=0,acknowledged=0,working=0;for(const auto& [id,observation]:a.communicationWindow)if(tick-observation.first<50){++attempted;if(observation.second)++acknowledged;}
@@ -420,7 +459,8 @@ class Simulation {
         return {{"gain",f.gain},{"priority",f.priority},{"reliability",f.reliability},{"communication",f.communication},{"distance",f.distance},{"energy",f.energy},{"uncertainty",f.uncertainty},{"workload",f.workload},{"communicationCost",f.bytes},{"switching",f.switching},{"score",c.score},{"estimatedEnergy",c.energy}};
     }
     std::vector<Candidate> candidates(Agent& a,int64_t availableEnergy=-1)const {
-        auto d=distances(a.knowledge.planning_grid(),a.pos);auto groups=frontier_groups(a.knowledge);std::vector<Candidate> out;
+        const auto known=a.knowledge.planning_grid();const AgentView view{a.id,a.pos,a.energy,known};
+        auto d=distances(view.localMap,view.position);auto groups=frontier_groups(a.knowledge);std::vector<Candidate> out;
         for(int r=0;r<static_cast<int>(groups.size());++r){int cell=-1;
             for(int p:groups[r])if(d[p]<INF&&(cell<0||std::pair(d[p],p)<std::pair(d[cell],cell)))cell=p;
             if(cell>=0)out.push_back(make_candidate(a.knowledge,a.pos,availableEnergy>=0?availableEnergy:a.energy,cell,r,a,&d));
@@ -449,22 +489,40 @@ class Simulation {
         return true;
     }
     void coordinator() {
-        std::string strategy=config["strategy"];if(strategy=="independent"||strategy=="decentralized"||tick%5)return;
-        const auto& groups=frontier_groups(base);if(groups.empty())return;
+        std::string strategy=config["strategy"];if(strategy=="independent"||strategy=="decentralized"||(strategy=="adaptive"&&!config.value("adaptiveCoordinatorEnabled",true)))return;
+        for(auto it=baseClaims.begin();it!=baseClaims.end();)if(std::get<1>(it->second)<=tick)it=baseClaims.erase(it);else ++it;
+        const auto& groups=frontier_groups(base);
+        std::vector<std::pair<int,std::tuple<int,int,int>>> acknowledged(baseClaims.begin(),baseClaims.end());
+        std::sort(acknowledged.begin(),acknowledged.end(),[](const auto& a,const auto& b){return std::tuple(std::get<2>(a.second),std::get<0>(a.second),a.first)<std::tuple(std::get<2>(b.second),std::get<0>(b.second),b.first);});
+        std::set<int> occupiedComponents;
+        for(const auto& [cell,claim]:acknowledged){int component=-1;for(int g=0;g<static_cast<int>(groups.size());++g)if(std::binary_search(groups[g].begin(),groups[g].end(),cell)){component=g;break;}
+            if(component<0||!occupiedComponents.insert(component).second){int owner=std::get<0>(claim);baseClaims.erase(cell);std::string reason=component<0?"FRONTIER_RESOLVED":"FRONTIER_COMPONENT_MERGED";
+                send(-1,owner,"revoke",{{"task",cell},{"revocationTick",tick},{"reason",reason}});event("coordinator_claim_released",{{"task",cell},{"reason",reason}},owner);
+            }
+        }
+        if(groups.empty())return;
         std::set<int> orphanTasks;
         for(const auto& [id,r]:reports){auto contact=base.contacts.find(id);bool unavailable=contact!=base.contacts.end()&&contact->second.status!="ACTIVE";
             if(r.task>=0&&(unavailable||(tick-r.tick>15&&r.lease<=tick))&&is_frontier(base,r.task))orphanTasks.insert(r.task);
         }
+        if(tick%5&&orphanTasks.empty())return;
+        const auto graph=base.planning_grid();const CoordinatorView view{graph};
         std::vector<int> eligible;
-        for(const auto& [id,r]:reports)if(tick-r.tick<=15&&r.status=="ACTIVE"&&r.ready&&r.activity!="CHARGING"&&r.activity!="RETURNING"&&r.activity!="QUEUED"&&(strategy=="adaptive"||r.task<0||r.lease<=tick||!is_frontier(base,r.task)))eligible.push_back(id);
+        for(const auto& [id,r]:reports)if(tick-r.tick<=15&&r.status=="ACTIVE"&&r.ready&&r.activity!="CHARGING"&&r.activity!="RETURNING"&&r.activity!="QUEUED"&&(strategy=="adaptive"||r.task<0||r.lease<=tick||!is_frontier(base,r.task))){
+            auto contact=base.contacts.find(id);if(contact!=base.contacts.end()&&contact->second.status!="ACTIVE")continue;
+            auto offer=baseOffers.find(id);if(offer!=baseOffers.end()&&tick-std::get<1>(offer->second)<=3)continue;
+            bool held=false;for(const auto& [cell,claim]:baseClaims)if(std::get<0>(claim)==id&&is_frontier(base,cell))held=true;
+            if(!held||strategy=="adaptive")eligible.push_back(id);
+        }
         std::vector<std::vector<Candidate>> rows;
-        for(int id:eligible){const auto& r=reports[id];auto d=distances(base.planning_grid(),r.pos);std::vector<Candidate> row;
+        for(int id:eligible){const auto& r=reports[id];auto d=distances(view.deliveredMap,r.pos);std::vector<Candidate> row;
             Agent deliveredAgent;deliveredAgent.id=id;deliveredAgent.task=r.task;deliveredAgent.success=r.success;deliveredAgent.resolved=r.resolved;deliveredAgent.distance=r.distance;deliveredAgent.attempted=r.attempted;deliveredAgent.delivered=r.delivered;deliveredAgent.reportedCommunication=r.communication;deliveredAgent.reportedWorkload=r.workload;deliveredAgent.urgentTasks=orphanTasks;
             for(int j=0;j<static_cast<int>(groups.size());++j){int cell=-1;
                 for(int p:groups[j])if(d[p]<INF&&(cell<0||std::pair(d[p],p)<std::pair(d[cell],cell)))cell=p;
                 auto c=cell<0?Candidate{}:make_candidate(base,r.pos,r.energy,cell,j,deliveredAgent,&d);
                 // Preserve live commitments within this delivered-information domain.
                 for(const auto& [owner,other]:reports)if(owner!=id&&other.lease>tick&&other.task>=0&&std::binary_search(groups[j].begin(),groups[j].end(),other.task))c.feasible=false;
+                for(const auto& [cell,claim]:baseClaims)if(std::get<0>(claim)!=id&&std::get<1>(claim)>tick&&std::binary_search(groups[j].begin(),groups[j].end(),cell))c.feasible=false;
                 row.push_back(c);
             }
             if(!orphanTasks.empty()){bool urgentFeasible=false;for(const auto& c:row)if(c.feasible&&c.features.priority>=1)urgentFeasible=true;
@@ -472,7 +530,7 @@ class Simulation {
             }
             rows.push_back(row);
         }
-        auto assignment=match(rows,strategy);
+        auto assignment=allocate({rows,strategy}).assignments;
         for(int i=0;i<static_cast<int>(eligible.size());++i){int id=eligible[i];if(assignment[i]>=0){const auto& c=rows[i][assignment[i]];
             baseOffers[id]={c.cell,tick,tick+15};send(-1,id,"offer",{{"task",c.cell},{"epoch",tick},{"score",c.score}});
         }else send(-1,id,"idle",{{"epoch",tick}});}
@@ -660,18 +718,16 @@ class Simulation {
             for(int id=0;id<static_cast<int>(agents.size());++id){auto contact=base.contacts.find(id);if(contact==base.contacts.end()||contact->second.status=="ACTIVE")jointMembers.push_back(id);}
             if(jointMembers.empty()){abort_joint("NO_AVAILABLE_MEMBERS");return false;}
             jointPhase="PREPARING";jointDeadline=tick+2*config["communication"]["delayMaxTicks"].get<int>()+5;
-            for(int id:jointMembers){auto& a=agents[id];if(a.status!="ACTIVE")continue;
-                a.jointAwait=true;a.jointEpoch=jointEpoch;a.jointDeadline=jointDeadline;a.jointGoal=a.task>=0&&a.activity!="CHARGING"?a.task:a.pos;
-                auto payload=report_payload(a,-1);payload["epoch"]=jointEpoch;payload["goal"]=a.jointGoal;payload["planningMap"]=a.knowledge.planning_grid().cells;
-                send(id,-1,"joint_ready",payload);
-            }
+            for(int id:jointMembers)send(-1,id,"joint_prepare",{{"epoch",jointEpoch},{"deadline",jointDeadline}});
             event("joint_plan_requested",{{"epoch",jointEpoch},{"members",jointMembers}});
         }
         if(jointPhase=="PREPARING"&&jointReady.size()==jointMembers.size()){
             std::vector<int> starts,goals;std::vector<Grid> graphs;
             for(int id:jointMembers){const auto& r=jointReady.at(id);Grid graph(truth.width,truth.height);graph.cells=r["planningMap"].get<std::vector<int>>();graphs.push_back(std::move(graph));starts.push_back(r["pos"]);goals.push_back(r["goal"]);}
-            int horizon=std::min(128,config["maxTicks"].get<int>()-tick);
+            int horizon=config["maxTicks"].get<int>()-tick;
             auto solution=cbs(graphs.front(),starts,goals,horizon,5000,100000,&graphs);
+            for(const auto& constraint:solution.constraintTrace)event("cbs_constraint",{{"epoch",jointEpoch},{"agentId",jointMembers[constraint.agent]},{"timeOffset",constraint.time},{"from",constraint.from},{"to",constraint.to}});
+            event("cbs_search",{{"epoch",jointEpoch},{"highExpanded",solution.high},{"lowExpanded",solution.low},{"constraintsConsidered",solution.constraintsConsidered},{"traceTruncated",solution.constraintsConsidered>static_cast<int>(solution.constraintTrace.size())}});
             expanded+=solution.low;cbsExpanded+=solution.high;++replans;
             if(solution.paths.empty()){abort_joint(solution.exhausted?"BUDGET_EXHAUSTED":"NO_SOLUTION_WITHIN_HORIZON");return false;}
             jointSolution=std::move(solution.paths);jointPhase="ROUTES";jointDeadline=tick+2*config["communication"]["delayMaxTicks"].get<int>()+5;
@@ -685,7 +741,7 @@ class Simulation {
             for(int id:jointMembers)send(-1,id,"joint_commit",{{"epoch",jointEpoch},{"startTick",start},{"deadline",jointDeadline}});
             event("joint_plan_committed",{{"epoch",jointEpoch},{"startTick",start}});
         }
-        bool controls=jointPhase!="BACKOFF"&&jointPhase!="IDLE";
+        bool controls=false;
         for(auto& a:agents){paths[a.id]={a.pos};
             if(a.jointAwait){controls=true;continue;}
             if(a.jointPath.empty()||a.jointStart<0)continue;
@@ -693,7 +749,7 @@ class Simulation {
             if(tick<a.jointStart)continue;
             int index=tick-a.jointStart,last=static_cast<int>(a.jointPath.size())-1;
             int expected=a.jointPath[std::min(index,last)];
-            bool goalChanged=a.jointGoal!=a.pos&&a.task!=a.jointGoal;
+            bool goalChanged=a.jointGoal!=a.pos&&(a.task!=a.jointGoal||(a.activity=="EXPLORING"&&!is_frontier(a.knowledge,a.jointGoal)));
             int next=a.jointPath[std::min(index+1,last)];
             if(a.pos!=expected||goalChanged||!a.knowledge.planning_grid().free(next)){
                 a.jointPath.clear();a.jointAwait=false;send(a.id,-1,"joint_nack",{{"epoch",a.jointEpoch},{"reason","LOCAL_ROUTE_INVALID"}});continue;
@@ -723,13 +779,14 @@ class Simulation {
         std::vector<std::vector<int>> paths(agents.size());bool cbsUsed=false;
         if(config["planner"]=="cbs")cbsUsed=joint_paths(paths);
         int horizon=config["reservationHorizon"];
-        if(!cbsUsed){std::vector<int> order;for(int i=0;i<static_cast<int>(agents.size());++i)order.push_back((i+tick)%agents.size());
+        {std::vector<int> order;for(int i=0;i<static_cast<int>(agents.size());++i)order.push_back((i+tick)%agents.size());
             std::stable_sort(order.begin(),order.end(),[&](int a,int b){return std::pair(agents[a].activity!="RETURNING",-agents[a].blocked)<std::pair(agents[b].activity!="RETURNING",-agents[b].blocked);});
             std::map<int,std::vector<int>> planned;
-            for(int id:order){auto& a=agents[id];if(!enabled[id]){planned[id]={a.pos};paths[id]={a.pos};continue;}
+            if(cbsUsed)for(const auto& a:agents)if(a.jointAwait||!a.jointPath.empty())planned[a.id]=paths[a.id];
+            for(int id:order){auto& a=agents[id];if(planned.count(id))continue;if(!enabled[id]){planned[id]={a.pos};paths[id]={a.pos};continue;}
                 Reservations r;for(int j=0;j<static_cast<int>(agents.size());++j)if(j!=id)r.reserve(planned.count(j)?planned[j]:std::vector<int>{positions[j]},horizon);
                 if(a.task>=0){
-                    auto graph=a.knowledge.planning_grid();auto spatial=search(graph,a.pos,a.task,config["pathfinder"]=="astar");expanded+=spatial.expanded;
+                    auto graph=a.knowledge.planning_grid();auto spatial=plan(PlanningView{graph},PathRequest{a.pos,a.task,config["pathfinder"]=="astar"});expanded+=spatial.expanded;
                     if(spatial.path.empty()){a.task=-1;a.parking=false;a.parkingReason.clear();decide(a,"route_invalid");paths[id]={a.pos};}
                     else {auto route=space_time(graph,a.pos,a.task,horizon,r,{},id,100000,true);expanded+=route.expanded;paths[id]=route.path.empty()?std::vector<int>{a.pos}:route.path;}
                     ++replans;
@@ -738,10 +795,19 @@ class Simulation {
         }
         for(int i=0;i<static_cast<int>(agents.size());++i){agents[i].path=paths[i];if(enabled[i]&&paths[i].size()>1)intents[i]=paths[i][1];}
         auto committed=arbitrate(truth,positions,intents,enabled,tick%agents.size());
-        for(int i=0;i<static_cast<int>(agents.size());++i){auto& a=agents[i];if(committed[i]!=intents[i]){++prevented;event("movement_rejected",{{"from",a.pos},{"to",intents[i]}},i);}
+        for(int i=0;i<static_cast<int>(agents.size());++i){auto& a=agents[i];if(committed[i]!=intents[i]){++prevented;
+                std::string reason="ACTION_VETO";
+                if(!truth.free(intents[i]))reason="BLOCKED_CELL";
+                else for(int peer=0;peer<static_cast<int>(agents.size());++peer)if(peer!=i){
+                    if(intents[peer]==intents[i])reason="DESTINATION_CONFLICT";
+                    if(intents[peer]==positions[i]&&intents[i]==positions[peer]){reason="EDGE_SWAP";break;}
+                    if(intents[i]==positions[peer]&&committed[peer]==positions[peer])reason="OCCUPIED_CELL";
+                }
+                json rejection={{"tick",tick},{"from",a.pos},{"to",intents[i]},{"reason",reason}};a.rejections.push_back(rejection);if(a.rejections.size()>12)a.rejections.pop_front();event("movement_rejected",rejection,i);
+            }
             bool moved=committed[i]!=a.pos;
             if(a.status=="ACTIVE"){++a.operationalTicks;if(moved||a.activity=="EXPLORING")++a.busyTicks;}
-            if(moved){spend(a,e("movementCost"),"movement");a.pos=committed[i];++a.distance;++totalDistance;if(visited[a.pos])++repeated;visited[a.pos]=true;a.visitedCells.insert(a.pos);a.recentPositions.push_back(a.pos);if(a.recentPositions.size()>100)a.recentPositions.pop_front();a.blocked=0;}
+            if(moved){if(a.pendingMovementTick>=0)++unclassifiedMoves;a.pendingMovementTick=tick;spend(a,e("movementCost"),"movement");a.pos=committed[i];++a.distance;++totalDistance;if(visited[a.pos])++repeated;visited[a.pos]=true;a.visitedCells.insert(a.pos);a.recentPositions.push_back(a.pos);if(a.recentPositions.size()>100)a.recentPositions.pop_front();a.blocked=0;}
             else if(a.status=="ACTIVE"&&a.activity!="CHARGING"){spend(a,std::min<int64_t>(a.energy,e("waitingCost")),"waiting");if(a.task>=0)++a.blocked;}
             if(a.blocked>=10&&a.parking){a.parking=false;a.parkingReason.clear();release_task(a,"staging_blocked");a.blocked=0;}
             if(a.blocked>=10&&a.activity!="RETURNING"&&a.activity!="QUEUED"){
@@ -750,7 +816,7 @@ class Simulation {
                 }
                 if(!stage_for_congestion(a)){release_task(a,"congestion_reallocate");decide(a,"congestion_reallocate");a.blocked=0;}
             }
-            if(a.activity=="CHARGING") {int64_t gain=std::min<int64_t>(e("chargingRate"),e("capacity")-a.energy);a.energy+=gain;charged+=gain;a.status="ACTIVE";}
+            if(a.activity=="CHARGING") {int64_t gain=std::min<int64_t>(e("chargingRate"),e("capacity")-a.energy);a.energy+=gain;charged+=gain;a.energyCharged+=gain;a.status="ACTIVE";}
             if(a.energy==0&&a.status=="ACTIVE"&&!station(a.pos)){a.status="DEPLETED";event("energy_depleted",{},i);}
             if(a.task<0&&a.activity=="EXPLORING")a.activity="IDLE";
             if(a.parking&&a.pos==a.task){a.parking=false;a.parkingReason.clear();a.task=-1;a.activity="IDLE";}
@@ -763,6 +829,19 @@ class Simulation {
             for(auto it=a.communicationWindow.begin();it!=a.communicationWindow.end();)if(tick-it->second.first>=50)it=a.communicationWindow.erase(it);else ++it;
         }
         if(std::set<int>(committed.begin(),committed.end()).size()!=committed.size())throw std::runtime_error("COLLISION_INVARIANT");
+    }
+    void evaluate_duplicate_claims() {
+        std::set<std::pair<int,int>> current;
+        if(config["strategy"]!="independent")for(int i=0;i<static_cast<int>(agents.size());++i)for(int j=i+1;j<static_cast<int>(agents.size());++j){
+            const auto& a=agents[i];const auto& b=agents[j];
+            if(a.status!="ACTIVE"||b.status!="ACTIVE"||a.activity!="EXPLORING"||b.activity!="EXPLORING"||a.task<0||b.task<0||a.lease<=tick||b.lease<=tick)continue;
+            bool overlap=a.task==b.task;
+            for(const auto& [id,region]:a.regions)if(std::binary_search(region.begin(),region.end(),a.task))for(const auto& [peerId,peerRegion]:b.regions)if(std::binary_search(peerRegion.begin(),peerRegion.end(),b.task)){
+                auto x=region.begin(),y=peerRegion.begin();while(x!=region.end()&&y!=peerRegion.end()){if(*x==*y){overlap=true;break;}if(*x<*y)++x;else ++y;}
+            }
+            if(overlap){current.insert({i,j});if(!duplicatePairs.count({i,j})){++duplicateClaimEpisodes;event("duplicate_claim",{{"agents",{i,j}},{"tasks",{a.task,b.task}}});}}
+        }
+        duplicateClaimTicks+=current.size();duplicatePairs=std::move(current);
     }
     void generate() {
         int w=config["width"],h=config["height"];truth=Grid(w,h,1);uint64_t rng=seed;
@@ -825,35 +904,58 @@ class Simulation {
         }
     }
 public:
+    void validate_fault(const json& f)const {
+        const auto type=f.at("type").get<std::string>();int when=f.at("tick");
+        if(when<0||when>100000)throw std::invalid_argument("invalid fault tick");
+        if(type=="agent_failure"||type=="agent_disable"){
+            int id=f.at("agentId");if(id<0||id>=config["agentCount"].get<int>())throw std::invalid_argument("fault references missing agent");
+            if(type=="agent_disable"&&!f.contains("restorationTick"))throw std::invalid_argument("disable requires restorationTick");
+        }else if(type=="block_cell"){int x=f.at("x"),y=f.at("y");if(x<0||y<0||x>=config["width"].get<int>()||y>=config["height"].get<int>())throw std::invalid_argument("fault cell outside map");}
+        else if(type=="partition"){if(!f.contains("endTick"))throw std::invalid_argument("partition requires endTick");if(f.contains("split")){int split=f["split"];if(split<1||split>config["agentCount"].get<int>())throw std::invalid_argument("invalid partition split");}}
+        else throw std::invalid_argument("unknown fault type");
+        for(const char* key:{"restorationTick","unblockTick","endTick"})if(f.contains(key)&&(f[key].get<int>()<=when||f[key].get<int>()>100000))throw std::invalid_argument("invalid fault end tick");
+    }
     void initialize(json input) {
         *this=Simulation{};config=defaults();config.merge_patch(input);
         int w=config["width"],h=config["height"],n=config["agentCount"];
-        if(w<4||h<4||w>256||h>256||n<1||n>32)throw std::invalid_argument("invalid dimensions or agent count");
-        seed=std::stoull(config["seed"].get<std::string>());
+        if(w<16||h<16||w>256||h>256||n<1||n>32)throw std::invalid_argument("invalid dimensions or agent count");
+        for(const auto& [name,value]:config["energy"].items())if(!value.is_number_integer()||value.get<int64_t>()<0||value.get<int64_t>()>2000000000LL)throw std::invalid_argument("invalid integer energy cost");
+        if(e("capacity")<1||e("movementCost")<1||e("chargingRate")<1||e("reserve")>=e("capacity"))throw std::invalid_argument("invalid energy bounds");
+        for(const char* name:{"movementCost","sensingCost","waitingCost"})if(e(name)>1000000)throw std::invalid_argument("action cost exceeds supported range");
+        if(e("transmitCostPerByte")>100||e("receiveCostPerByte")>100||e("chargingRate")>1000000000||e("reserve")>1000000000)throw std::invalid_argument("energy parameter exceeds supported range");
+        if(config["maxTicks"].get<int>()<1||config["maxTicks"].get<int>()>100000||config["sensorRadius"].get<int>()<1||config["sensorRadius"].get<int>()>8)throw std::invalid_argument("invalid time or sensing bounds");
+        const auto& communication=config["communication"];
+        if(communication["delayMinTicks"].get<int>()<1||communication["delayMaxTicks"].get<int>()>100||communication["delayMinTicks"].get<int>()>communication["delayMaxTicks"].get<int>()||communication["dropProbability"].get<double>()<0||communication["dropProbability"].get<double>()>1)throw std::invalid_argument("invalid communication bounds");
+        int64_t net=e("chargingRate")-e("chargingRate")/4;
+        int64_t queue=((static_cast<int64_t>(e("capacity"))+net-1)/net)*(n-1)*(static_cast<int64_t>(e("waitingCost"))+e("sensingCost"));
+        if(queue+static_cast<int64_t>(w)*h*(static_cast<int64_t>(e("movementCost"))+e("sensingCost"))+e("reserve")>9007199254740991LL)throw std::invalid_argument("derived energy exceeds JSON safe integer range");
+        const auto seedText=config["seed"].get<std::string>();if(seedText.empty()||seedText.find_first_not_of("0123456789")!=std::string::npos)throw std::invalid_argument("seed must be an unsigned decimal string");
+        try{seed=std::stoull(seedText);}catch(const std::exception&){throw std::invalid_argument("seed outside uint64 range");}
         bool custom=config.contains("map");
         if(custom){
             truth=Grid(w,h);truth.cells=config["map"].get<std::vector<int>>();if(truth.cells.size()!=static_cast<std::size_t>(w*h))throw std::invalid_argument("invalid map size");
             targets=config.value("targets",std::vector<int>(w*h));zones=config.value("zones",std::vector<int>(w*h));
             if(targets.size()!=truth.cells.size()||zones.size()!=truth.cells.size())throw std::invalid_argument("invalid target/zone size");
-            for(int p=0;p<w*h;++p)if((truth.cells[p]!=0&&truth.cells[p]!=1)||(targets[p]!=0&&targets[p]!=1)||(targets[p]&&!truth.free(p))||zones[p]<0||zones[p]>100)throw std::invalid_argument("invalid custom cell, target, or priority");
+            for(int p=0;p<w*h;++p)if((truth.cells[p]!=0&&truth.cells[p]!=1)||(targets[p]!=0&&targets[p]!=1)||(targets[p]&&!truth.free(p))||zones[p]<0||zones[p]>100||(zones[p]&&!truth.free(p)))throw std::invalid_argument("invalid custom cell, target, or priority");
             config["targetCount"]=std::count(targets.begin(),targets.end(),1);
         }else generate();
         if(config["starts"].size()!=static_cast<std::size_t>(n)||config["chargingStations"].empty())throw std::invalid_argument("starts and charging stations required");
-        for(const auto& s:config["chargingStations"]){int p=at(s);if(!truth.free(p))throw std::invalid_argument("station must be free");stations.push_back(p);}
+        std::set<std::string> stationIds;for(const auto& s:config["chargingStations"]){int p=at(s);if(!truth.free(p)||station(p)||!stationIds.insert(s.at("id").get<std::string>()).second)throw std::invalid_argument("stations must occupy distinct free cells and have unique IDs");stations.push_back(p);}
         base=Knowledge(w,h);observed.assign(w*h,false);visited.assign(w*h,false);mapped.assign(w*h,false);observable.assign(w*h,false);discovery.assign(w*h,-1);initialReachable.assign(w*h,0);
         std::set<int> used;
-        for(int i=0;i<n;++i){Agent a;a.id=i;a.pos=at(config["starts"][i]);a.energy=e("capacity");a.knowledge=Knowledge(w,h);
+        for(int i=0;i<n;++i){if(config["starts"][i].value("agentId",-1)!=i)throw std::invalid_argument("starts must use ordered contiguous agent IDs");Agent a;a.id=i;a.pos=at(config["starts"][i]);a.energy=e("capacity");a.knowledge=Knowledge(w,h);
             if(!truth.free(a.pos)||!used.insert(a.pos).second)throw std::invalid_argument("invalid or duplicate starts");
             visited[a.pos]=true;a.visitedCells.insert(a.pos);a.recentPositions.push_back(a.pos);auto d=distances(truth,a.pos);for(int p=0;p<w*h;++p)if(d[p]<INF)initialReachable[p]=1;agents.push_back(a);
         }
         for(int p=0;p<w*h;++p)if(initialReachable[p]){observable[p]=true;for(int v:truth.neighbors(p))if(!truth.free(v))observable[v]=true;}
         faults=config["faultSchedule"].get<std::vector<json>>();
+        if(faults.size()>1000)throw std::invalid_argument("fault schedule limit reached");for(const auto& fault:faults)validate_fault(fault);
         apply_faults();for(auto& a:agents){sense(a,false);update_regions(a);}
         config["map"]=truth.cells;config["targets"]=targets;config["zones"]=zones;
         initialScenario={{"config",config},{"mapHash",hash_json({{"width",w},{"height",h},{"map",truth.cells},{"targets",targets},{"zones",zones}})},{"generatorVersion",custom?"custom-1":"rooms-2"},{"componentCount",component_count(truth)}};
         event("initialized",{{"mapHash",initialScenario["mapHash"]}});heartbeats();
     }
-    void queue_fault(json f){if(faults.size()>=1000)throw std::invalid_argument("fault schedule limit reached");faults.push_back(f);event("fault_queued",f);}
+    void queue_fault(json f){if(faults.size()>=1000)throw std::invalid_argument("fault schedule limit reached");validate_fault(f);faults.push_back(f);event("fault_queued",f);}
     void advance() {
         if(status!="READY"&&status!="RUNNING")return;
         auto start=std::chrono::steady_clock::now();status="RUNNING";++tick;
@@ -869,7 +971,7 @@ public:
         apply_faults();auto phase=std::chrono::steady_clock::now();deliver();communicationMs=elapsed(phase);
         phase=std::chrono::steady_clock::now();for(auto& a:agents){sense(a);update_regions(a);}detect();sensingMs=elapsed(phase);
         phase=std::chrono::steady_clock::now();for(auto& a:agents)energy_mode(a);coordinator();for(auto& a:agents)local_allocate(a);allocationMs=elapsed(phase);
-        phase=std::chrono::steady_clock::now();movement();planningMs=elapsed(phase);
+        phase=std::chrono::steady_clock::now();evaluate_duplicate_claims();movement();planningMs=elapsed(phase);
         phase=std::chrono::steady_clock::now();heartbeats();communicationMs+=elapsed(phase);
         int now=static_cast<int>(std::count(observed.begin(),observed.end(),true));stagnant=old==now?stagnant+1:0;
         bool any=false;for(const auto& a:agents)if(a.status=="ACTIVE"||(a.status=="DEPLETED"&&station(a.pos)))any=true;
@@ -888,6 +990,7 @@ public:
     }
     json scenario()const{return initialScenario;}
     std::string state_status()const{return status;}
+    json tick_measurement()const{return {{"tick",tick},{"tickMs",lastTickMs},{"sensingMs",sensingMs},{"communicationMs",communicationMs},{"allocationMs",allocationMs},{"planningMs",planningMs}};}
     json take_events(){json out=events;events=json::array();return out;}
     json snapshot()const {
         json out={{"tick",tick},{"status",status},{"width",truth.width},{"height",truth.height},{"strategy",config["strategy"]},{"planner",config["planner"]},
@@ -895,9 +998,9 @@ public:
         int required=0,known=0,targetCount=0,found=0;int64_t spent=0;
         std::vector<int> team(truth.size(),-1),times(truth.size(),-1),teamZones(truth.size(),0);
         for(const auto& a:agents){spent+=a.spent;for(int p=0;p<truth.size();++p)if(a.knowledge.times[p]>times[p]){times[p]=a.knowledge.times[p];team[p]=a.knowledge.grid.cells[p];teamZones[p]=a.knowledge.priority[p];}
-            json claims=json::array();for(const auto& [cell,claim]:a.claims)if(std::get<2>(claim)>tick)claims.push_back({{"cell",cell},{"owner",std::get<0>(claim)},{"score",std::get<1>(claim)},{"expires",std::get<2>(claim)}});
-            bool recentPeer=false;for(const auto& [id,last]:a.peerSeen)if(tick-last<=15)recentPeer=true;
-            std::string comm=tick-a.lastBase<=10?"CONNECTED":(recentPeer?"DEGRADED":"ISOLATED");
+            json claims=json::array();for(const auto& [cell,claim]:a.claims)if(std::get<2>(claim)>tick)claims.push_back({{"cell",cell},{"owner",std::get<0>(claim)},{"score",std::get<1>(claim)},{"expires",std::get<2>(claim)},{"confirmed",a.committedClaims.count(cell)>0}});
+            bool recentPeer=false;for(const auto& [id,last]:a.peerSeen)if(tick-last<=config["communication"]["heartbeatTimeoutTicks"].get<int>())recentPeer=true;
+            std::string comm=tick-a.lastBase<=config["communication"]["heartbeatTimeoutTicks"].get<int>()?"CONNECTED":(recentPeer?"DEGRADED":"ISOLATED");
             std::vector<int> knownTargets;for(int p=0;p<truth.size();++p)if(a.knowledge.targets[p])knownTargets.push_back(p);
             json regions=json::array();std::string assignedRegion;for(const auto& [id,cells]:a.regions){regions.push_back({{"id",id},{"cells",cells}});if(std::binary_search(cells.begin(),cells.end(),a.task))assignedRegion=id;}
             out["agents"].push_back({{"id",a.id},{"position",a.pos},{"status",a.status},{"activity",a.activity},{"energy",a.energy},{"capacity",e("capacity")},{"distance",a.distance},{"task",a.task},{"lease",a.lease},{"path",a.path},{"map",a.knowledge.grid.cells},{"mapRevision",a.knowledge.revision},{"communication",comm},{"decisions",a.decisions},{"features",a.chosen},{"claims",claims},{"energySpent",a.spent},{"knownTargets",knownTargets},{"regions",regions},{"assignedRegion",assignedRegion}});
@@ -906,11 +1009,15 @@ public:
         out["unionMap"]=team;out["allTargetsDiscovered"]=found==targetCount;out["truthZones"]=zones;out["unionZones"]=teamZones;out["coordinatorZones"]=base.priority;
         out["coordinatorTargets"]=json::array();for(int p=0;p<truth.size();++p)if(base.targets[p])out["coordinatorTargets"].push_back(p);
         out["coordinatorAgents"]=json::array();for(const auto& [id,r]:reports)out["coordinatorAgents"].push_back({{"id",id},{"position",r.pos},{"status",r.status},{"observedTick",r.tick},{"task",r.task}});
+        out["coordinatorClaims"]=json::array();for(const auto& [cell,claim]:baseClaims)if(std::get<1>(claim)>tick)out["coordinatorClaims"].push_back({{"cell",cell},{"owner",std::get<0>(claim)},{"expiry",std::get<1>(claim)},{"acknowledgedTick",std::get<2>(claim)}});
         out["stationQueues"]=json::array();for(int cell:stations){json queue=json::array();std::vector<std::pair<int,int>> ordered;auto requests=stationRequests.find(cell);if(requests!=stationRequests.end())for(const auto& [id,requestTick]:requests->second)if(agents[id].status=="ACTIVE")ordered.push_back({requestTick,id});std::sort(ordered.begin(),ordered.end());for(const auto& [requestTick,id]:ordered)queue.push_back({{"agentId",id},{"requestTick",requestTick}});out["stationQueues"].push_back({{"cell",cell},{"queue",queue}});}
         for(auto& view:out["agents"]){const auto& a=agents[view["id"].get<int>()];view["knownAgents"]=json::array();for(const auto& [id,c]:a.knowledge.contacts)view["knownAgents"].push_back({{"id",id},{"position",c.position},{"status",c.status},{"observedTick",c.tick}});
             view["taskKind"]=a.task<0?"NONE":a.parking?"PARKING":(a.activity=="RETURNING"||a.activity=="QUEUED")?"CHARGING":"FRONTIER";
             view["parkingReason"]=a.parkingReason;
             view["energyLedger"]=a.energyLedger;
+            view["energyCharged"]=a.energyCharged;
+            view["recentRejections"]=a.rejections;view["coordinatorAgeTicks"]=a.lastBase<0?json(nullptr):json(tick-a.lastBase);
+            view["peerFreshness"]=json::array();for(const auto& [id,last]:a.peerSeen)view["peerFreshness"].push_back({{"agentId",id},{"ageTicks",tick-last},{"suspected",a.suspected.count(id)>0}});
             view["alternatives"]=a.alternatives;view["alternativesTick"]=a.alternativesTick;
             view["coordinationStatus"]=a.jointAwait?"AWAITING_JOINT_PLAN":!a.jointPath.empty()?"EXECUTING_JOINT_PLAN":"LOCAL";
             view["visitedCells"]=a.visitedCells;view["recentPositions"]=a.recentPositions;view["sensedCells"]=a.sensedCells.size();view["utilization"]=a.operationalTicks?100.0*a.busyTicks/a.operationalTicks:0;
@@ -928,6 +1035,13 @@ public:
         int globalFree=0,globalKnown=0,knownObstacles=0;for(int p=0;p<truth.size();++p){if(config["map"][p]==0){++globalFree;if(observed[p])++globalKnown;}if(mapped[p]&&!truth.free(p))++knownObstacles;}
         out["metrics"]["globalCoverage"]=globalFree?100.0*globalKnown/globalFree:100;
         out["metrics"]["globalFreeCells"]=globalFree;out["metrics"]["observedObstacleCells"]=knownObstacles;
+        int pending=0;for(const auto& a:agents)if(a.pendingMovementTick>=0)++pending;
+        out["metrics"]["nonproductiveMovement"]=nonproductiveMoves;out["metrics"]["productiveMovement"]=productiveMoves;out["metrics"]["unclassifiedMovement"]=unclassifiedMoves+pending;
+        out["metrics"]["energyPerObservedFreeCell"]=known?json(static_cast<double>(spent)/known):json(nullptr);
+        out["metrics"]["messagesAttempted"]=attemptedMessages;out["metrics"]["messagesDelivered"]=deliveredMessages;
+        out["metrics"]["messageDeliveryRatio"]=attemptedMessages?static_cast<double>(deliveredMessages)/attemptedMessages:0;
+        out["metrics"]["duplicateClaims"]=duplicatePairs.size();out["metrics"]["duplicateClaimTicks"]=duplicateClaimTicks;out["metrics"]["duplicateClaimEpisodes"]=duplicateClaimEpisodes;
+        out["communicationCounters"]={{"attemptedMessages",attemptedByType},{"deliveredMessages",deliveredByType},{"attemptedBytes",attemptedBytesByType},{"deliveredBytes",deliveredBytesByType}};
         out["metrics"]["explorationCompletionTick"]=finishAt>=0?json(finishAt):json(nullptr);
         out["metrics"]["targetDiscoveryRestrictedTicks"]=targetCount?json(restricted/targetCount):json(nullptr);
         out["metrics"]["targetDiscoveryFraction"]=targetCount?static_cast<double>(found)/targetCount:1;

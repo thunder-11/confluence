@@ -113,3 +113,19 @@ def test_restart_preserves_committed_state_and_marks_interrupted_work(tmp_path):
         reopened.query("SELECT status FROM experiment_batches", one=True)["status"]
         == "INTERRUPTED"
     )
+    assert (
+        reopened.query("SELECT type,payload_json FROM events", one=True)["type"]
+        == "terminal"
+    )
+    assert (
+        reopened.query("SELECT schema_version FROM run_snapshots", one=True)[
+            "schema_version"
+        ]
+        == 1
+    )
+    assert (
+        reopened.query("SELECT metric_name FROM benchmark_results", one=True)[
+            "metric_name"
+        ]
+        == "coverage"
+    )

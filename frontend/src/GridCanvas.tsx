@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useId } from "react";
 import { Maximize2, Minus, Plus } from "lucide-react";
 import type { Snapshot, Config } from "./types";
 import { colors } from "./types";
@@ -35,6 +35,10 @@ export default function GridCanvas({
     py: number;
   } | null>(null);
   const geometry = useRef({ unit: 1, x: 0, y: 0, w: 64, h: 64 });
+  const renderSamples = useRef<number[]>([]);
+  const [cursor, setCursor] = useState(0),
+    [focused, setFocused] = useState(false);
+  const keyboardHelpId = useId();
   const displayAgents =
     s?.agents.flatMap((a) => {
       if (mode === "agent" && a.id !== selected) {
@@ -62,13 +66,33 @@ export default function GridCanvas({
                 position: known.position,
                 status: known.status,
                 path: [],
-                task: known.task,
+                task:
+                  s.coordinatorClaims?.find((c) => c.owner === a.id)?.cell ??
+                  known.task,
               },
             ]
           : [];
       }
       return [a];
     }) || [];
+  const gridWidth = editConfig?.width || s?.width || 64;
+  const gridHeight = editConfig?.height || s?.height || 64;
+  const cursorCell = Math.min(cursor, gridWidth * gridHeight - 1);
+  const displayCells =
+    editConfig?.map ||
+    (mode === "truth"
+      ? s?.truth
+      : mode === "agent"
+        ? s?.agents[selected]?.map
+        : mode === "coordinator"
+          ? s?.coordinatorMap
+          : s?.unionMap);
+  const cursorDescription =
+    displayCells?.[cursorCell] === 0
+      ? "free"
+      : displayCells?.[cursorCell] === 1
+        ? "blocked"
+        : "unknown";
   useEffect(() => {
     if (!host.current) return;
     const observer = new ResizeObserver((entries) => {
@@ -83,194 +107,235 @@ export default function GridCanvas({
     if (!c) return;
     const ctx = c.getContext("2d");
     if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = size.w * dpr;
-    c.height = size.h * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.fillStyle = "#191d1c";
-    ctx.fillRect(0, 0, size.w, size.h);
-    const w = editConfig?.width || s?.width || 64,
-      h = editConfig?.height || s?.height || 64;
-    const unit = Math.min((size.w - 48) / w, (size.h - 48) / h) * zoom;
-    const ox = (size.w - w * unit) / 2 + pan.x,
-      oy = (size.h - h * unit) / 2 + pan.y;
-    geometry.current = { unit, x: ox, y: oy, w, h };
-    const cells =
-      editConfig?.map ||
-      (mode === "truth"
-        ? s?.truth
-        : mode === "agent"
-          ? s?.agents[selected]?.map
-          : mode === "coordinator"
-            ? s?.coordinatorMap
-            : s?.unionMap);
-    if (!cells) {
-      ctx.fillStyle = "#b2b9b5";
-      ctx.font = "14px IBM Plex Sans";
-      ctx.textAlign = "center";
-      ctx.fillText("Preparing the environment…", size.w / 2, size.h / 2);
-      return;
-    }
-    for (let p = 0; p < cells.length; p++) {
-      const x = ox + (p % w) * unit,
-        y = oy + Math.floor(p / w) * unit;
-      if (x + unit < 0 || y + unit < 0 || x > size.w || y > size.h) continue;
-      ctx.fillStyle =
-        cells[p] === -1 ? "#222725" : cells[p] === 1 ? "#69756f" : "#e4ede7";
-      ctx.fillRect(x, y, unit, unit);
-      if (unit >= 4) {
-        ctx.strokeStyle = cells[p] === -1 ? "#2a302d" : "#cdd7d0";
-        ctx.lineWidth = 0.35;
-        ctx.strokeRect(x, y, unit, unit);
-      }
-    }
-    const center = (p: number) => ({
-      x: ox + ((p % w) + 0.5) * unit,
-      y: oy + (Math.floor(p / w) + 0.5) * unit,
-    });
-    const zones =
-      editConfig?.zones ||
-      (mode === "truth"
-        ? s?.truthZones
-        : mode === "agent"
-          ? s?.agents[selected]?.knownZones
-          : mode === "coordinator"
-            ? s?.coordinatorZones
-            : s?.unionZones) ||
-      [];
-    zones.forEach((priority, p) => {
-      if (priority <= 0 || cells[p] !== 0) return;
-      const { x, y } = center(p);
-      ctx.strokeStyle = "#aa8437";
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(
-        x - unit * 0.38,
-        y - unit * 0.38,
-        unit * 0.76,
-        unit * 0.76,
-      );
-    });
-    const stations = editConfig
-      ? editConfig.chargingStations.map((p) => p.y * w + p.x)
-      : s?.stations || [];
-    for (const p of stations) {
-      const { x, y } = center(p);
-      ctx.fillStyle = "#6ca885";
-      ctx.fillRect(x - unit * 0.39, y - unit * 0.39, unit * 0.78, unit * 0.78);
-      if (unit > 7) {
-        ctx.fillStyle = "#183f2c";
-        ctx.font = `bold ${Math.max(7, unit * 0.65)}px IBM Plex Sans`;
+    const draw = () => {
+      const dpr = window.devicePixelRatio || 1;
+      c.width = size.w * dpr;
+      c.height = size.h * dpr;
+      ctx.scale(dpr, dpr);
+      ctx.fillStyle = "#191d1c";
+      ctx.fillRect(0, 0, size.w, size.h);
+      const w = editConfig?.width || s?.width || 64,
+        h = editConfig?.height || s?.height || 64;
+      const unit = Math.min((size.w - 48) / w, (size.h - 48) / h) * zoom;
+      const ox = (size.w - w * unit) / 2 + pan.x,
+        oy = (size.h - h * unit) / 2 + pan.y;
+      geometry.current = { unit, x: ox, y: oy, w, h };
+      const drawCursor = () => {
+        if (!focused) return;
+        const cell = Math.min(cursor, w * h - 1);
+        ctx.strokeStyle = "#267d73";
+        ctx.lineWidth = 3;
+        ctx.strokeRect(
+          ox + (cell % w) * unit + 1,
+          oy + Math.floor(cell / w) * unit + 1,
+          Math.max(1, unit - 2),
+          Math.max(1, unit - 2),
+        );
+      };
+      const cells =
+        editConfig?.map ||
+        (mode === "truth"
+          ? s?.truth
+          : mode === "agent"
+            ? s?.agents[selected]?.map
+            : mode === "coordinator"
+              ? s?.coordinatorMap
+              : s?.unionMap);
+      if (!cells) {
+        ctx.fillStyle = "#b2b9b5";
+        ctx.font = "14px IBM Plex Sans";
         ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText("ϟ", x, y);
+        ctx.fillText("Preparing the environment…", size.w / 2, size.h / 2);
+        drawCursor();
+        return;
       }
-    }
-    const ts = editConfig
-      ? editConfig.targets?.flatMap((v, p) =>
-          v ? [{ cell: p, discovered: true, tick: 0 }] : [],
-        ) || []
-      : s?.targets || [];
-    for (const t of ts) {
-      const known =
-        mode === "agent"
-          ? s?.agents[selected]?.knownTargets?.includes(t.cell)
-          : mode === "coordinator"
-            ? s?.coordinatorTargets?.includes(t.cell)
-            : t.discovered;
-      if (!editConfig && mode !== "truth" && !known) continue;
-      const { x, y } = center(t.cell);
-      ctx.beginPath();
-      ctx.moveTo(x, y - unit * 0.35);
-      ctx.lineTo(x + unit * 0.35, y);
-      ctx.lineTo(x, y + unit * 0.35);
-      ctx.lineTo(x - unit * 0.35, y);
-      ctx.closePath();
-      ctx.fillStyle = t.discovered ? "#cfaa5b" : "#8d7546";
-      ctx.fill();
-    }
-    if (editConfig) {
-      for (const a of editConfig.starts) {
-        const { x, y } = center(a.y * w + a.x);
-        ctx.fillStyle = colors[a.agentId % colors.length];
-        ctx.beginPath();
-        ctx.arc(x, y, unit * 0.42, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      return;
-    }
-    if (paths && s)
-      for (const a of displayAgents) {
-        if (mode === "agent" && a.id !== selected) continue;
-        const region = a.regions?.find((r) => r.id === a.assignedRegion);
-        if (region) {
-          ctx.fillStyle = colors[a.id % colors.length];
-          ctx.globalAlpha = 0.25;
-          for (const p of region.cells) {
-            const { x, y } = center(p);
-            ctx.fillRect(x - unit * 0.5, y - unit * 0.5, unit, unit);
-          }
-          ctx.globalAlpha = 1;
-        }
-        if (a.path.length < 2) continue;
-        ctx.strokeStyle = colors[a.id % colors.length];
-        ctx.globalAlpha = a.id === selected ? 0.9 : 0.4;
-        ctx.lineWidth = Math.max(1.3, unit * 0.16);
-        ctx.beginPath();
-        a.path.forEach((p, i) => {
-          const { x, y } = center(p);
-          if (i) ctx.lineTo(x, y);
-          else ctx.moveTo(x, y);
-        });
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-        if (a.task >= 0) {
-          const { x, y } = center(a.task);
-          ctx.strokeStyle = colors[a.id % colors.length];
-          ctx.lineWidth = 1.5;
-          ctx.strokeRect(
-            x - unit * 0.6,
-            y - unit * 0.6,
-            unit * 1.2,
-            unit * 1.2,
-          );
-        }
-      }
-    if (s)
-      for (const a of displayAgents) {
-        const { x, y } = center(a.position);
-        const showLabel =
-          unit > 9 || displayAgents.length <= 4 || a.id === selected;
-        const radius = Math.max(showLabel ? 7 : 4, unit * 0.43);
+      for (let p = 0; p < cells.length; p++) {
+        const x = ox + (p % w) * unit,
+          y = oy + Math.floor(p / w) * unit;
+        if (x + unit < 0 || y + unit < 0 || x > size.w || y > size.h) continue;
         ctx.fillStyle =
-          a.status === "ACTIVE" ? colors[a.id % colors.length] : "#676b68";
-        ctx.beginPath();
-        ctx.arc(x, y, radius, 0, Math.PI * 2);
-        ctx.fill();
-        if (a.id === selected) {
-          ctx.strokeStyle = "#fff";
-          ctx.lineWidth = 1.8;
-          ctx.beginPath();
-          ctx.arc(x, y, radius + 2.5, 0, Math.PI * 2);
-          ctx.stroke();
+          cells[p] === -1 ? "#222725" : cells[p] === 1 ? "#69756f" : "#e4ede7";
+        ctx.fillRect(x, y, unit, unit);
+        if (unit >= 4) {
+          ctx.strokeStyle = cells[p] === -1 ? "#2a302d" : "#cdd7d0";
+          ctx.lineWidth = 0.35;
+          ctx.strokeRect(x, y, unit, unit);
         }
-        if (showLabel) {
-          ctx.fillStyle = "#fff";
-          ctx.font = `500 ${Math.max(10, unit * 0.6)}px IBM Plex Sans`;
+      }
+      const center = (p: number) => ({
+        x: ox + ((p % w) + 0.5) * unit,
+        y: oy + (Math.floor(p / w) + 0.5) * unit,
+      });
+      const zones =
+        editConfig?.zones ||
+        (mode === "truth"
+          ? s?.truthZones
+          : mode === "agent"
+            ? s?.agents[selected]?.knownZones
+            : mode === "coordinator"
+              ? s?.coordinatorZones
+              : s?.unionZones) ||
+        [];
+      zones.forEach((priority, p) => {
+        if (priority <= 0 || cells[p] !== 0) return;
+        const { x, y } = center(p);
+        ctx.strokeStyle = "#aa8437";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(
+          x - unit * 0.38,
+          y - unit * 0.38,
+          unit * 0.76,
+          unit * 0.76,
+        );
+      });
+      const stations = editConfig
+        ? editConfig.chargingStations.map((p) => p.y * w + p.x)
+        : s?.stations || [];
+      for (const p of stations) {
+        const { x, y } = center(p);
+        ctx.fillStyle = "#6ca885";
+        ctx.fillRect(
+          x - unit * 0.39,
+          y - unit * 0.39,
+          unit * 0.78,
+          unit * 0.78,
+        );
+        if (unit > 7) {
+          ctx.fillStyle = "#183f2c";
+          ctx.font = `bold ${Math.max(7, unit * 0.65)}px IBM Plex Sans`;
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
-          ctx.fillText(String(a.id + 1), x, y + 0.5);
-        }
-        if (a.status !== "ACTIVE") {
-          ctx.strokeStyle = "#fff";
-          ctx.beginPath();
-          ctx.moveTo(x - 3, y - 3);
-          ctx.lineTo(x + 3, y + 3);
-          ctx.moveTo(x + 3, y - 3);
-          ctx.lineTo(x - 3, y + 3);
-          ctx.stroke();
+          ctx.fillText("ϟ", x, y);
         }
       }
-  }, [s, mode, selected, paths, editConfig, size, zoom, pan]);
+      const ts = editConfig
+        ? editConfig.targets?.flatMap((v, p) =>
+            v ? [{ cell: p, discovered: true, tick: 0 }] : [],
+          ) || []
+        : s?.targets || [];
+      for (const t of ts) {
+        const known =
+          mode === "agent"
+            ? s?.agents[selected]?.knownTargets?.includes(t.cell)
+            : mode === "coordinator"
+              ? s?.coordinatorTargets?.includes(t.cell)
+              : t.discovered;
+        if (!editConfig && mode !== "truth" && !known) continue;
+        const { x, y } = center(t.cell);
+        ctx.beginPath();
+        ctx.moveTo(x, y - unit * 0.35);
+        ctx.lineTo(x + unit * 0.35, y);
+        ctx.lineTo(x, y + unit * 0.35);
+        ctx.lineTo(x - unit * 0.35, y);
+        ctx.closePath();
+        ctx.fillStyle = t.discovered ? "#cfaa5b" : "#8d7546";
+        ctx.fill();
+      }
+      if (editConfig) {
+        for (const a of editConfig.starts) {
+          const { x, y } = center(a.y * w + a.x);
+          ctx.fillStyle = colors[a.agentId % colors.length];
+          ctx.beginPath();
+          ctx.arc(x, y, unit * 0.42, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        drawCursor();
+        return;
+      }
+      if (paths && s)
+        for (const a of displayAgents) {
+          if (mode === "agent" && a.id !== selected) continue;
+          const region = a.regions?.find((r) => r.id === a.assignedRegion);
+          if (region) {
+            ctx.fillStyle = colors[a.id % colors.length];
+            ctx.globalAlpha = 0.25;
+            for (const p of region.cells) {
+              const { x, y } = center(p);
+              ctx.fillRect(x - unit * 0.5, y - unit * 0.5, unit, unit);
+            }
+            ctx.globalAlpha = 1;
+          }
+          if (a.path.length < 2) continue;
+          ctx.strokeStyle = colors[a.id % colors.length];
+          ctx.globalAlpha = a.id === selected ? 0.9 : 0.4;
+          ctx.lineWidth = Math.max(1.3, unit * 0.16);
+          ctx.beginPath();
+          a.path.forEach((p, i) => {
+            const { x, y } = center(p);
+            if (i) ctx.lineTo(x, y);
+            else ctx.moveTo(x, y);
+          });
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          if (a.task >= 0) {
+            const { x, y } = center(a.task);
+            ctx.strokeStyle = colors[a.id % colors.length];
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(
+              x - unit * 0.6,
+              y - unit * 0.6,
+              unit * 1.2,
+              unit * 1.2,
+            );
+          }
+        }
+      if (s)
+        for (const a of displayAgents) {
+          const { x, y } = center(a.position);
+          const showLabel =
+            unit > 9 || displayAgents.length <= 4 || a.id === selected;
+          const radius = Math.max(showLabel ? 7 : 4, unit * 0.43);
+          ctx.fillStyle =
+            a.status === "ACTIVE" ? colors[a.id % colors.length] : "#676b68";
+          ctx.beginPath();
+          ctx.arc(x, y, radius, 0, Math.PI * 2);
+          ctx.fill();
+          if (a.id === selected) {
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            ctx.arc(x, y, radius + 2.5, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          if (showLabel) {
+            ctx.fillStyle = "#fff";
+            ctx.font = `500 ${Math.max(10, unit * 0.6)}px IBM Plex Sans`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(String(a.id + 1), x, y + 0.5);
+          }
+          if (a.status !== "ACTIVE") {
+            ctx.strokeStyle = "#fff";
+            ctx.beginPath();
+            ctx.moveTo(x - 3, y - 3);
+            ctx.lineTo(x + 3, y + 3);
+            ctx.moveTo(x + 3, y - 3);
+            ctx.lineTo(x - 3, y + 3);
+            ctx.stroke();
+          }
+        }
+      drawCursor();
+    };
+    let frame = 0;
+    const render = (now: number) => {
+      const began = performance.now();
+      draw();
+      const samples = renderSamples.current;
+      if (samples.length && now - samples[samples.length - 1] > 1000)
+        samples.length = 0;
+      samples.push(now);
+      if (samples.length > 120) samples.shift();
+      c.dataset.renderFrames = String(Number(c.dataset.renderFrames || 0) + 1);
+      c.dataset.renderFps =
+        samples.length > 1
+          ? String((1000 * (samples.length - 1)) / (now - samples[0]))
+          : "0";
+      c.dataset.drawMs = String(performance.now() - began);
+      frame = requestAnimationFrame(render);
+    };
+    frame = requestAnimationFrame(render);
+    return () => cancelAnimationFrame(frame);
+  }, [s, mode, selected, paths, editConfig, size, zoom, pan, cursor, focused]);
   function cellAt(e: React.PointerEvent) {
     const b = canvas.current!.getBoundingClientRect(),
       g = geometry.current;
@@ -282,6 +347,37 @@ export default function GridCanvas({
     <div ref={host} className={"grid-canvas " + (compact ? "compact" : "")}>
       <canvas
         ref={canvas}
+        tabIndex={0}
+        role="application"
+        aria-describedby={keyboardHelpId}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        onKeyDown={(e) => {
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
+          const g = geometry.current,
+            current = Math.min(cursor, g.w * g.h - 1);
+          let x = current % g.w,
+            y = Math.floor(current / g.w);
+          if (e.key === "ArrowUp") y = Math.max(0, y - 1);
+          else if (e.key === "ArrowDown") y = Math.min(g.h - 1, y + 1);
+          else if (e.key === "ArrowLeft") x = Math.max(0, x - 1);
+          else if (e.key === "ArrowRight") x = Math.min(g.w - 1, x + 1);
+          else if (e.key === "Home") {
+            x = 0;
+            y = 0;
+          } else if (e.key === "End") {
+            x = g.w - 1;
+            y = g.h - 1;
+          } else if (e.key === " " || e.key === "Enter") {
+            if (onPaint) onPaint(current);
+            else {
+              const agent = displayAgents.find((a) => a.position === current);
+              if (agent) onSelect?.(agent.id);
+            }
+          } else return;
+          e.preventDefault();
+          setCursor(y * g.w + x);
+        }}
         aria-label={
           editConfig
             ? "Custom map editor"
@@ -289,6 +385,7 @@ export default function GridCanvas({
         }
         onPointerDown={(e) => {
           const p = cellAt(e);
+          if (p >= 0) setCursor(p);
           if (onPaint && p >= 0) {
             onPaint(p);
             canvas.current?.setPointerCapture(e.pointerId);
@@ -330,6 +427,16 @@ export default function GridCanvas({
           );
         }}
       />
+      <span id={keyboardHelpId} className="sr-only">
+        Use arrow keys to move the cursor, Home or End to reach a corner, and
+        Enter or Space to{" "}
+        {editConfig ? "paint with the selected brush" : "select an agent"}. Tab
+        leaves the grid.
+      </span>
+      <span className="sr-only" role="status">
+        Cell ({cursorCell % gridWidth}, {Math.floor(cursorCell / gridWidth)}),{" "}
+        {cursorDescription}.
+      </span>
       {!compact && (
         <>
           <div className="canvas-caption">

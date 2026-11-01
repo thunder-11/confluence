@@ -26,6 +26,7 @@ from .models import CreateScenario, CreateRun, Command, CreateExperiment, Inject
 from .store import Store
 from .statistics import summarize
 from .host import host_info
+from .deltas import difference
 
 TERMINAL = {"COMPLETED", "EXHAUSTED", "TIMED_OUT", "STOPPED", "FAILED"}
 store = Store()
@@ -138,26 +139,29 @@ class Run:
             "tick": self.snapshot["tick"],
             "type": "engine_error",
             "agentId": None,
-            "payload": {"message": message},
+            "payload": {"reason": "ENGINE_ERROR", "message": message},
         }
-        store.save_tick(self.id, self.snapshot, [event], "FAILED")
-        store.execute(
-            "UPDATE simulation_runs SET termination_reason=? WHERE id=?",
-            (message, self.id),
+        store.save_tick(
+            self.id, self.snapshot, [event], "FAILED", reason="ENGINE_ERROR"
         )
         await self.publish([event])
         await self.engine.close()
 
     async def loop(self):
         try:
+            clock = asyncio.get_running_loop()
+            deadline = clock.time()
             while self.state == "RUNNING":
-                start = asyncio.get_running_loop().time()
                 await self.advance()
-                delay = max(
-                    0, 1 / self.speed - (asyncio.get_running_loop().time() - start)
-                )
+                deadline += 1 / self.speed
+                # Absolute deadlines prevent coarse OS timers from adding drift
+                # on every tick. Bound catch-up after a prolonged external stall.
+                if deadline < clock.time() - 10 / self.speed:
+                    deadline = clock.time()
+                delay = max(0, deadline - clock.time())
                 try:
                     await asyncio.wait_for(self.wake.wait(), timeout=delay)
+                    deadline = clock.time()
                 except asyncio.TimeoutError:
                     pass
                 self.wake.clear()
@@ -174,6 +178,27 @@ class Run:
         self.wake.set()
         if task and task is not asyncio.current_task():
             await task
+
+    async def stop(self, trigger):
+        self.state = "STOPPED"
+        await self.cancel_loop()
+        if self.state != "STOPPED":
+            return
+        await self.engine.close()
+        sequence = store.query(
+            "SELECT COALESCE(MAX(sequence),0)+1 AS n FROM events WHERE run_id=?",
+            (self.id,),
+            one=True,
+        )["n"]
+        event = {
+            "sequence": sequence,
+            "tick": self.snapshot["tick"],
+            "type": "terminal",
+            "agentId": None,
+            "payload": {"reason": "STOPPED", "trigger": trigger},
+        }
+        store.save_tick(self.id, self.snapshot, [event], "STOPPED")
+        await self.publish([event])
 
 
 async def create_run(body: CreateRun, batch_id=None, config_override=None):
@@ -448,18 +473,13 @@ async def _command(id: str, body: Command):
     elif body.command == "stop":
         if run.state in TERMINAL:
             raise HTTPException(409, "run already terminated")
-        run.state = "STOPPED"
-        await run.cancel_loop()
-        await run.engine.close()
-        store.save_tick(id, run.snapshot, [], "STOPPED")
+        await run.stop("USER_STOP")
     elif body.command == "reset":
         if run.state == "RUNNING":
             raise HTTPException(409, "pause before resetting")
         # Preserve the original run as evidence; reset creates a fresh run identity.
         if run.state not in TERMINAL:
-            run.state = "STOPPED"
-            await run.engine.close()
-            store.save_tick(id, run.snapshot, [], "STOPPED")
+            await run.stop("RESET")
         original = run.initial_config
         async with execution_lock:
             if any(r.state not in TERMINAL for r in runs.values()) or any(
@@ -578,6 +598,8 @@ async def events(
         ],
         "discoveries": ["target_discovered"],
         "planning": [
+            "cbs_constraint",
+            "cbs_search",
             "movement_rejected",
             "planner_fallback",
             "obstacle_blocked",
@@ -663,6 +685,8 @@ async def stream(ws: WebSocket, id: str):
     run = runs[id]
     queue = asyncio.Queue(maxsize=2)
     run.clients.add(queue)
+    previous = run.snapshot
+    stream_sequence = run.sequence
     try:
         await ws.send_json(
             {
@@ -680,7 +704,23 @@ async def stream(ws: WebSocket, id: str):
         )
         while True:
             item = await queue.get()
-            await ws.send_json(item)
+            current = item["payload"]["snapshot"]
+            base_sequence = stream_sequence
+            stream_sequence += 1
+            await ws.send_json(
+                {
+                    **item,
+                    "sequence": stream_sequence,
+                    "type": "delta",
+                    "payload": {
+                        "baseSequence": base_sequence,
+                        "patch": difference(previous, current),
+                        "events": item["payload"]["events"],
+                        "status": item["payload"]["status"],
+                    },
+                }
+            )
+            previous = current
             await asyncio.sleep(0.1)
     except (WebSocketDisconnect, RuntimeError):
         pass
@@ -722,9 +762,7 @@ async def execute_batch(id, body, base_config, custom=False):
                 run.state = "RUNNING"
                 while run.state not in TERMINAL:
                     if require_row("experiment_batches", id)["status"] == "CANCELLED":
-                        run.state = "STOPPED"
-                        store.save_tick(run.id, run.snapshot, [], "STOPPED")
-                        await run.engine.close()
+                        await run.stop("BATCH_CANCELLED")
                         return
                     await run.advance()
                     await asyncio.sleep(0)

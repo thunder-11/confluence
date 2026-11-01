@@ -37,6 +37,10 @@ import {
   YAxis,
 } from "recharts";
 import GridCanvas from "./GridCanvas";
+import WorkspaceSwitcher from "./WorkspaceSwitcher";
+import { applyStatePatch } from "./patch";
+import { demos, demoConfig } from "./demos";
+import type { Demo } from "./demos";
 import { AgentAnalytics, EventLog, ExperimentAnalytics } from "./Diagnostics";
 import type { KnowledgeMode } from "./GridCanvas";
 import {
@@ -58,13 +62,14 @@ import type {
   Strategy,
 } from "./types";
 
-type Page = "studio" | "overview" | "builder" | "compare" | "experiments";
+type Page = "studio" | "overview" | "builder" | "compare" | "experiments" | "demos";
 const pageNames: Record<Page, string> = {
   studio: "Simulation studio",
   overview: "Overview",
   builder: "Scenario builder",
   compare: "Compare strategies",
   experiments: "Experiments",
+  demos: "Demo scenarios",
 };
 const format = (n: number | undefined, d = 0) =>
   n === undefined
@@ -200,6 +205,8 @@ function Chart({
 
 export default function App() {
   const [page, setPage] = useState<Page>(() => {
+      const route = location.hash.slice(1);
+      if (Object.hasOwn(pageNames, route)) return route as Page;
       const saved = localStorage.getItem("confluence.page");
       return saved && saved in pageNames ? (saved as Page) : "studio";
     }),
@@ -235,6 +242,9 @@ export default function App() {
     >([]),
     [seeds, setSeeds] = useState("100, 101, 102"),
     [experimentTicks, setExperimentTicks] = useState(1000);
+  const [studyScenarioId, setStudyScenarioId] = useState("");
+  const [experimentName, setExperimentName] = useState("");
+  const [studyStrategies, setStudyStrategies] = useState<Strategy[]>([...strategies]);
   const started = useRef(false),
     snapshotRef = useRef(snapshot),
     statusRef = useRef(status);
@@ -365,7 +375,26 @@ export default function App() {
   }, [perform, refresh]);
   useEffect(() => {
     localStorage.setItem("confluence.page", page);
+    if (location.hash !== `#${page}`) history.pushState(null, "", `#${page}`);
+    document.title = `${pageNames[page]} · CONFLUENCE`;
+    window.scrollTo({ top: 0 });
+    setMenu(false);
   }, [page]);
+  useEffect(() => {
+    const followRoute = () => {
+      const route = location.hash.slice(1);
+      if (Object.hasOwn(pageNames, route)) setPage(route as Page);
+    };
+    const closeOnEscape = (e: KeyboardEvent) => { if (e.key === "Escape") setMenu(false); };
+    window.addEventListener("hashchange", followRoute);
+    window.addEventListener("popstate", followRoute);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("hashchange", followRoute);
+      window.removeEventListener("popstate", followRoute);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, []);
   useEffect(() => {
     if (batch) localStorage.setItem("confluence.batch", batch.id);
   }, [batch?.id]);
@@ -377,6 +406,8 @@ export default function App() {
     let retries = 0;
     const connect = () => {
       if (disposed) return;
+      let wireState: Snapshot | undefined;
+      let wireSequence = -1;
       ws = new WebSocket(
         `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/v1/runs/${runId}/stream`,
       );
@@ -386,15 +417,32 @@ export default function App() {
       };
       ws.onmessage = (e) => {
         const message = JSON.parse(e.data);
-        if (message.type !== "snapshot") return;
         const p = message.payload;
-        setSnapshot(p.snapshot);
+        if (message.type === "snapshot") wireState = p.snapshot;
+        else if (
+          message.type === "delta" &&
+          wireState &&
+          p.baseSequence === wireSequence &&
+          message.sequence === wireSequence + 1
+        )
+          wireState = applyStatePatch(wireState, p.patch) as Snapshot;
+        else {
+          wireState = undefined;
+          void api<Snapshot>(`/runs/${runId}/snapshot`)
+            .then(setSnapshot)
+            .catch((e) => setError(e.message));
+          ws?.close();
+          return;
+        }
+        wireSequence = message.sequence;
+        const state = wireState!;
+        setSnapshot(state);
         setStatus(p.status);
         setEvents((old) => [...old, ...(p.events || [])].slice(-400));
         setSeries((old) => {
           const next = [
-            ...old.filter((x) => x.tick !== p.snapshot.tick),
-            { tick: p.snapshot.tick, ...p.snapshot.metrics },
+            ...old.filter((x) => x.tick !== state.tick),
+            { tick: state.tick, ...state.metrics },
           ];
           return next.length > 1000 ? next.filter((_, i) => i % 2 === 0) : next;
         });
@@ -547,6 +595,24 @@ export default function App() {
     if (index === 5) c.energy.capacity = 100000;
     await create(c, presetNames[index]);
   };
+  const launchDemo = (demo: Demo) => perform(async () => {
+    await stopActive();
+    const s = await api<Scenario>("/scenarios", { name: `Demo · ${demo.name}`, config: demoConfig(demo) });
+    setScenario(s);
+    setStrategy(demo.strategy);
+    setPlanner("reservations");
+    setPathfinder("astar");
+    setMode("union");
+    setPaths(true);
+    setSpeed(20);
+    const r = await api<{ id: string; snapshot: Snapshot; status: string }>("/runs", {
+      scenarioId: s.id, strategy: demo.strategy, planner: "reservations", pathfinder: "astar",
+    });
+    adopt(r);
+    await api(`/runs/${r.id}/commands`, { command: "set_speed", speed: 20 });
+    await refresh();
+    setPage("studio");
+  });
   const inject = (type: string) =>
     perform(async () => {
       if (!snapshot) return;
@@ -586,21 +652,23 @@ export default function App() {
       }
       await api(`/runs/${runId}/faults`, { ...fault, nextTick: true });
     });
-  const launchExperiment = () =>
+  const launchExperiment = (comparison = false) =>
     perform(async () => {
-      if (!scenario) throw new Error("Create a scenario first");
+      const chosenScenario = scenarios.find((s) => s.id === (studyScenarioId || scenario?.id)) || scenario;
+      if (!chosenScenario) throw new Error("Create or load a scenario first");
       await stopActive();
       const r = await api<{ id: string }>("/experiments", {
-        name: `${scenario.name} · allocation study`,
-        scenarioId: scenario.id,
-        seeds: seeds
+        name: comparison ? `${chosenScenario.name} · strategy comparison` : experimentName.trim() || `${chosenScenario.name} · allocation study`,
+        scenarioId: chosenScenario.id,
+        strategies: comparison ? strategies : studyStrategies,
+        seeds: comparison ? [chosenScenario.config.seed] : seeds
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean),
         maxTicks: experimentTicks,
       });
       setBatch(await api(`/experiments/${r.id}`));
-      setPage("compare");
+      setPage(comparison ? "compare" : "experiments");
       await refresh();
     });
   const shown = replayTick === null ? snapshot : replaySnapshot || snapshot;
@@ -614,12 +682,15 @@ export default function App() {
     .slice(-6)
     .reverse();
   const m = shown?.metrics || {};
+  const currentDemo = demos.find((demo) => scenario?.name === `Demo · ${demo.name}`);
   return (
     <div className="app-shell">
-      <aside className={menu ? "sidebar open" : "sidebar"}>
+      {menu && <button className="nav-backdrop" aria-label="Close navigation" onClick={() => setMenu(false)} />}
+      <aside id="primary-sidebar" className={menu ? "sidebar open" : "sidebar"}>
         <a
           className="brand"
-          href="#"
+          href="#studio"
+          aria-label="CONFLUENCE simulation studio"
           onClick={(e) => {
             e.preventDefault();
             setPage("studio");
@@ -637,38 +708,36 @@ export default function App() {
         >
           <X size={20} />
         </button>
-        <div className="workspace">
-          <span className="workspace-symbol">
-            <Network size={17} />
-          </span>
-          <div>
-            Local workspace<small>DSA / Multi-agent systems</small>
-          </div>
-          <ChevronDown size={14} />
-        </div>
-        <nav>
+        <WorkspaceSwitcher />
+        <nav aria-label="Main navigation">
           {(
             [
               { id: "overview", icon: LayoutDashboard },
               { id: "studio", icon: Grid2X2 },
+              { id: "demos", icon: Play },
               { id: "builder", icon: Settings2 },
               { id: "compare", icon: Workflow },
               { id: "experiments", icon: FlaskConical },
             ] as const
           ).map(({ id, icon: Icon }) => (
-            <button
+            <a
               key={id}
+              href={`#${id}`}
+              aria-label={pageNames[id]}
+              aria-current={page === id ? "page" : undefined}
+              title={pageNames[id]}
               className={page === id ? "nav-link active" : "nav-link"}
-              onClick={() => {
+              onClick={(e) => {
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+                e.preventDefault();
                 setPage(id);
                 setMenu(false);
                 refresh().catch(() => {});
               }}
             >
               <Icon size={17} />
-              {pageNames[id]}
-              {page === id && <ChevronRight size={14} />}
-            </button>
+              <span className="nav-label">{pageNames[id]}</span>
+            </a>
           ))}
         </nav>
         <div className="sidebar-note">
@@ -704,8 +773,10 @@ export default function App() {
         <header className="topbar">
           <button
             className="mobile-menu"
-            aria-label="Open navigation"
-            onClick={() => setMenu(true)}
+            aria-label={menu ? "Collapse navigation" : "Expand navigation"}
+            aria-expanded={menu}
+            aria-controls="primary-sidebar"
+            onClick={() => setMenu(!menu)}
           >
             <Menu size={20} />
           </button>
@@ -746,15 +817,12 @@ export default function App() {
                     Watch independent decisions become collective discovery.
                   </p>
                 </div>
-                <button
-                  className="button"
-                  disabled={busy}
-                  onClick={() => setConfigOpen(true)}
-                >
-                  <Settings2 size={15} />
-                  Configure scenario
-                </button>
+                <div className="studio-heading-actions">
+                  <button className="button" onClick={() => setPage("demos")}><Play size={15} />Demo scenarios</button>
+                  <button className="button" disabled={busy} onClick={() => setConfigOpen(true)}><Settings2 size={15} />Configure scenario</button>
+                </div>
               </div>
+              {currentDemo && <div className="demo-cue"><strong>{currentDemo.timeline}</strong><span>{currentDemo.watch}</span></div>}
               <div className="mission-bar">
                 <div>
                   <span className="scenario-symbol">
@@ -1052,6 +1120,12 @@ export default function App() {
                         Global coverage · %
                       </option>
                       <option value="distance">Distance · steps</option>
+                      <option value="nonproductiveMovement">
+                        Nonproductive movement · steps
+                      </option>
+                      <option value="messageDeliveryRatio">
+                        Message delivery ratio
+                      </option>
                       <option value="energyConsumed">
                         Energy · milliunits
                       </option>
@@ -1153,6 +1227,43 @@ export default function App() {
               </div>
             </>
           )}
+          {page === "demos" && (
+            <>
+              <div className="page-heading">
+                <div>
+                  <div className="breadcrumb">Ready for the presentation</div>
+                  <h1>Demo scenarios</h1>
+                  <p>Small maps. Real algorithms. Pick a scene and press Start in the studio.</p>
+                </div>
+                <span className="demo-size">16 × 16 grids · 2–4 agents</span>
+              </div>
+              <div className="demo-intro">
+                <div><strong>A short route through CONFLUENCE</strong><p>Start with First discovery, then show teamwork, a disruption, and charging. Each scene opens a fresh saved run, ready to present.</p></div>
+                <span>20 ticks / second<br /> · 400–600 tick limits</span>
+              </div>
+              <div className="demo-grid">
+                {demos.map((demo, i) => (
+                  <article className="demo-card" key={demo.id}>
+                    <div className="demo-map" aria-hidden="true">
+                      <svg viewBox="0 0 16 16">
+                        {demoConfig(demo).map!.map((wall, p) => wall ? <rect key={p} x={p % 16} y={Math.floor(p / 16)} width="1" height="1" fill="#687b70" /> : null)}
+                        {demoConfig(demo).starts.map((a) => <circle key={a.agentId} cx={a.x + .5} cy={a.y + .5} r=".45" fill={colors[a.agentId]} />)}
+                      </svg>
+                    </div>
+                    <div className="demo-card-body">
+                      <div className="demo-meta">Scene {i + 1} · {demo.agents} agents · up to {demo.ticks / 20}s at 20 t/s</div>
+                      <h2>{demo.name}</h2>
+                      <p>{demo.description}</p>
+                      <div className="demo-timeline">{demo.timeline}</div>
+                      <p className="demo-watch"><strong>Show this:</strong> {demo.watch}</p>
+                      <div className="demo-actions"><span>{strategyNames[demo.strategy]}</span><button className="button" disabled={busy} onClick={() => launchDemo(demo)} aria-label={`Load ${demo.name}`}><Play size={14} />Load demo</button></div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <p className="muted demo-footnote">Playback time excludes setup and pauses; a scene may finish earlier. Disruption and battery scenes may end incomplete. You can change speed, pause, step, or reset from the studio.</p>
+            </>
+          )}
           {page === "overview" && (
             <>
               <div className="page-heading">
@@ -1165,10 +1276,10 @@ export default function App() {
                 </div>
                 <button
                   className="button primary"
-                  onClick={() => setPage("studio")}
+                  onClick={() => setPage("demos")}
                 >
                   <Play size={15} />
-                  Open simulation
+                  Open demo scenarios
                 </button>
               </div>
               <div className="overview-mission">
@@ -1265,15 +1376,14 @@ export default function App() {
               onGenerate={() => setConfigOpen(true)}
             />
           )}
-          {(page === "compare" || page === "experiments") && (
+          {page === "compare" && (
             <>
               <div className="page-heading">
                 <div>
                   <div className="breadcrumb">Controlled evaluation</div>
                   <h1>{pageNames[page]}</h1>
                   <p>
-                    Identical seeded environments. Recorded outcomes. No assumed
-                    improvements.
+                    Compare all five strategies on one saved scenario and seed, then inspect their paths side by side.
                   </p>
                 </div>
                 {batch && (
@@ -1297,18 +1407,17 @@ export default function App() {
               </div>
               <section className="experiment-config">
                 <div>
-                  <h2>Allocation study</h2>
+                  <h2>One scenario, five strategies</h2>
                   <p>
-                    {scenario?.name || "Create a scenario first"} · A* +
-                    reservations · all five strategies
+                    Shared sensing, energy, A*, and reservation planning.
                   </p>
                 </div>
                 <label>
-                  Evaluation seeds
-                  <input
-                    value={seeds}
-                    onChange={(e) => setSeeds(e.target.value)}
-                  />
+                  Scenario
+                  <select value={studyScenarioId || scenario?.id || ""} onChange={(e) => setStudyScenarioId(e.target.value)}>
+                    {!scenarios.length && <option value="">Create a scenario first</option>}
+                    {scenarios.map((s) => <option key={s.id} value={s.id}>{s.name} · seed {s.config.seed}</option>)}
+                  </select>
                 </label>
                 <label>
                   Tick limit
@@ -1323,7 +1432,7 @@ export default function App() {
                 <button
                   className="button primary"
                   disabled={busy || batch?.status === "RUNNING"}
-                  onClick={launchExperiment}
+                  onClick={() => launchExperiment(true)}
                 >
                   <FlaskConical size={15} />
                   Run comparison
@@ -1391,66 +1500,58 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {page === "experiments" && (
-                <>
-                  <div className="section-heading">
-                    <h2>Saved experiments</h2>
-                    <button
-                      className="text-button"
-                      onClick={() =>
-                        refresh().catch((e) => setError(e.message))
-                      }
-                    >
-                      Refresh
-                    </button>
+            </>
+          )}
+          {page === "experiments" && (
+            <>
+              <div className="page-heading">
+                <div><div className="breadcrumb">Batch manager</div><h1>Experiments</h1><p>Define repeatable studies, track their runs, and keep the evidence in one place.</p></div>
+                <button className="button" aria-label="Refresh experiments" title="Refresh experiments" disabled={busy} onClick={() => perform(refresh)}><RotateCcw size={15} />Refresh experiments</button>
+              </div>
+              <div className="experiment-manager-layout">
+                <section className="experiment-definition">
+                  <h2>New experiment</h2>
+                  <p className="muted">Choose seeds and strategies for a sequential batch. Use Compare strategies for a quick single-seed comparison.</p>
+                  <label>Experiment name<input value={experimentName} placeholder="e.g. Communication resilience study" maxLength={120} onChange={(e) => setExperimentName(e.target.value)} /></label>
+                  <label>Saved scenario<select value={studyScenarioId || scenario?.id || ""} onChange={(e) => setStudyScenarioId(e.target.value)}>
+                    {!scenarios.length && <option value="">Create a scenario first</option>}
+                    {scenarios.map((s) => <option key={s.id} value={s.id}>{s.name} · {s.config.width} × {s.config.height}</option>)}
+                  </select></label>
+                  <div className="experiment-input-row">
+                    <label>Seeds, separated by commas<input value={seeds} onChange={(e) => setSeeds(e.target.value)} /></label>
+                    <label>Tick limit per run<input type="number" min="1" max="100000" value={experimentTicks} onChange={(e) => setExperimentTicks(+e.target.value)} /></label>
                   </div>
-                  {batchRows.length ? (
-                    <div className="table-wrap">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Experiment</th>
-                            <th>Status</th>
-                            <th>Action</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {batchRows.map((b) => (
-                            <tr key={b.id}>
-                              <td>
-                                {b.name}
-                                <small className="block mono">{b.id}</small>
-                              </td>
-                              <td>
-                                <Badge value={b.status} />
-                              </td>
-                              <td>
-                                <button
-                                  className="text-button"
-                                  onClick={() =>
-                                    perform(async () =>
-                                      setBatch(
-                                        await api(`/experiments/${b.id}`),
-                                      ),
-                                    )
-                                  }
-                                >
-                                  View results
-                                  <ArrowRight size={13} />
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                  <fieldset className="experiment-strategies"><legend>Allocation strategies</legend>
+                    {strategies.map((s) => <label key={s}><input type="checkbox" checked={studyStrategies.includes(s)} onChange={(e) => setStudyStrategies(e.target.checked ? strategies.filter((candidate) => candidate === s || studyStrategies.includes(candidate)) : studyStrategies.filter((candidate) => candidate !== s))} />{strategyNames[s]}</label>)}
+                  </fieldset>
+                  <div className="experiment-launch"><span>{seeds.split(",").map((s) => s.trim()).filter(Boolean).length} seeds × {studyStrategies.length} strategies = <strong>{seeds.split(",").map((s) => s.trim()).filter(Boolean).length * studyStrategies.length} runs</strong></span>
+                    <button className="button primary" disabled={busy || batch?.status === "RUNNING" || !studyStrategies.length || !seeds.trim() || !scenarios.length} onClick={() => launchExperiment()}><FlaskConical size={15} />Start batch</button>
+                  </div>
+                </section>
+                <section className="experiment-activity">
+                  <h2>Batch activity</h2>
+                  {batch ? <>
+                    <div className="experiment-activity-title"><strong>{batch.name}</strong><Badge value={batch.status} /></div>
+                    <p>{batch.runs.filter((r) => terminal(r.status)).length} of {batch.manifest.seeds.length * batch.manifest.strategies.length} runs finished</p>
+                    <progress aria-label="Batch completion" max={batch.manifest.seeds.length * batch.manifest.strategies.length} value={batch.runs.filter((r) => terminal(r.status)).length} />
+                    <dl className="experiment-facts"><div><dt>Seeds</dt><dd>{batch.manifest.seeds.join(", ")}</dd></div><div><dt>Strategies</dt><dd>{batch.manifest.strategies.length}</dd></div><div><dt>Execution</dt><dd>Sequential · native engine</dd></div></dl>
+                    <div className="experiment-activity-actions">
+                      <button className="button" onClick={() => setPage("compare")}><Workflow size={14} />Inspect comparison</button>
+                      {batch.status === "RUNNING" ? <button className="text-button" disabled={busy} onClick={() => perform(async () => { await api(`/experiments/${batch.id}/cancel`, {}); setBatch(await api(`/experiments/${batch.id}`)); await refresh(); })}>Cancel remaining runs</button> : <a className="button" href={`/api/v1/experiments/${batch.id}/export`}><ArrowDownToLine size={14} />Export evidence</a>}
                     </div>
-                  ) : (
-                    <p className="muted">
-                      Completed experiments will appear here.
-                    </p>
-                  )}
-                </>
-              )}
+                    <p className="muted experiment-note">Completed runs remain saved when a batch is cancelled. Detailed charts and synchronized replay open in Compare strategies.</p>
+                  </> : <div className="experiment-idle"><FlaskConical size={26} /><strong>No experiment selected</strong><p>Start a study or open one from the saved experiment list below.</p></div>}
+                </section>
+              </div>
+              <div className="section-heading"><h2>Saved experiments</h2><span>{batchRows.length} saved batches</span></div>
+              {batchRows.length ? <div className="table-wrap"><table>
+                <thead><tr><th>Experiment</th><th>Status</th><th>Actions</th></tr></thead>
+                <tbody>{batchRows.map((b) => <tr key={b.id}><td>{b.name}<small className="block mono">{b.id}</small></td><td><Badge value={b.status} /></td><td><div className="experiment-row-actions">
+                  <button className="text-button" disabled={busy} onClick={() => perform(async () => setBatch(await api(`/experiments/${b.id}`)))}>View batch</button>
+                  <button className="text-button" disabled={busy} onClick={() => perform(async () => { setBatch(await api(`/experiments/${b.id}`)); setPage("compare"); })}>Compare results <ArrowRight size={13} /></button>
+                  {b.status !== "RUNNING" && <a className="text-button" href={`/api/v1/experiments/${b.id}/export`} aria-label={`Export ${b.name}`}><ArrowDownToLine size={13} />Export</a>}
+                </div></td></tr>)}</tbody>
+              </table></div> : <div className="experiment-empty-library"><h3>Your experiment history starts here.</h3><p>Named batches, statuses, comparison results, and downloadable evidence will appear here after you start a study.</p></div>}
             </>
           )}
           <footer className="sheet-footer">
@@ -1610,6 +1711,20 @@ function AgentInspector({
                 {a.map.filter((v) => v >= 0).length} <span>cells</span>
               </dd>
             </div>
+            <div>
+              <dt>Map revision</dt>
+              <dd>{format(a.mapRevision)}</dd>
+            </div>
+            <div>
+              <dt>Coordinator update</dt>
+              <dd>
+                {a.coordinatorAgeTicks === undefined
+                  ? "Not recorded"
+                  : a.coordinatorAgeTicks === null
+                    ? "Not received"
+                    : `${a.coordinatorAgeTicks} ticks ago`}
+              </dd>
+            </div>
           </dl>
           <button className="inspect-map" onClick={onLocal}>
             Inspect internal map
@@ -1618,6 +1733,10 @@ function AgentInspector({
           {a.energyLedger && (
             <details className="energy-ledger">
               <summary>Energy ledger · milliunits</summary>
+              <p>
+                Total consumed: {format(a.energySpent)} · charged:{" "}
+                {format(a.energyCharged)}
+              </p>
               <dl className="agent-details">
                 {Object.entries(a.energyLedger).map(([action, cost]) => (
                   <div key={action}>
@@ -1628,6 +1747,46 @@ function AgentInspector({
               </dl>
             </details>
           )}
+          <details className="energy-ledger">
+            <summary>Peer updates and claims · {a.claims.length}</summary>
+            <dl className="agent-details">
+              {(a.peerFreshness || []).map((peer) => (
+                <div key={peer.agentId}>
+                  <dt>Agent {peer.agentId + 1}</dt>
+                  <dd>
+                    {peer.ageTicks} ticks ago
+                    {peer.suspected ? " · suspected" : ""}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+            {a.claims.slice(0, 12).map((claim) => (
+              <p key={`${claim.cell}-${claim.owner}`}>
+                {claim.confirmed ? "Claim" : "Bid"} · A{claim.owner + 1} ·{" "}
+                {coordinate(claim.cell, width)} · expires {claim.expires}
+              </p>
+            ))}
+            {!a.claims.length && <p>No current delivered claims.</p>}
+            {a.claims.length > 12 && (
+              <p>{a.claims.length - 12} more claims in the event log.</p>
+            )}
+          </details>
+          <details className="energy-ledger">
+            <summary>Recent movement rejections</summary>
+            {a.recentRejections?.length ? (
+              a.recentRejections
+                .slice()
+                .reverse()
+                .map((rejection, index) => (
+                  <p key={`${rejection.tick}-${index}`}>
+                    Tick {rejection.tick} · {text(rejection.reason)} ·{" "}
+                    {coordinate(rejection.to, width)}
+                  </p>
+                ))
+            ) : (
+              <p>No recent movement rejections.</p>
+            )}
+          </details>
         </>
       ) : tab === "statistics" ? (
         <AgentAnalytics runId={runId} agentId={a.id} tick={tick} />
@@ -2228,6 +2387,7 @@ function JsonConfig({
           energy: config.energy,
           communication: config.communication,
           adaptiveWeights: config.adaptiveWeights,
+          adaptiveCoordinatorEnabled: config.adaptiveCoordinatorEnabled ?? true,
         },
         null,
         2,
@@ -2256,6 +2416,7 @@ function JsonConfig({
               energy: p.energy,
               communication: p.communication,
               adaptiveWeights: p.adaptiveWeights,
+              adaptiveCoordinatorEnabled: p.adaptiveCoordinatorEnabled ?? true,
             });
             setErr("Applied to draft");
           } catch {
