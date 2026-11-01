@@ -1,0 +1,46 @@
+{
+  "runId": "e69921f3bc68489a",
+  "scenarioId": "50248db6ed8643da",
+  "tick": 8,
+  "agents": [
+    {
+      "id": 0,
+      "activity": "CHARGING",
+      "energy": 12280,
+      "position": 51
+    },
+    {
+      "id": 1,
+      "activity": "QUEUED",
+      "energy": 12140,
+      "position": 52
+    },
+    {
+      "id": 2,
+      "activity": "IDLE",
+      "energy": 15080,
+      "position": 83
+    },
+    {
+      "id": 3,
+      "activity": "IDLE",
+      "energy": 15080,
+      "position": 53
+    }
+  ],
+  "stationQueues": [
+    {
+      "cell": 51,
+      "queue": [
+        {
+          "agentId": 0,
+          "requestTick": 5
+        },
+        {
+          "agentId": 1,
+          "requestTick": 5
+        }
+      ]
+    }
+  ]
+}
