@@ -1,0 +1,14 @@
+.venv/
+.tools/
+build/
+data/
+node_modules/
+frontend/dist/
+__pycache__/
+.pytest_cache/
+.taste-skill/
+*.pyc
+*.log
+*.tsbuildinfo
+frontend/test-results/
+frontend/playwright-report/
